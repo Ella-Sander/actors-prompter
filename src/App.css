@@ -235,6 +235,24 @@
   cursor: pointer;
 }
 
+.brand-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.app-version {
+  padding: 4px 7px;
+  border: 1px solid var(--tone-303030);
+  color: var(--tone-858585);
+  font-family: 'Courier New', monospace;
+  font-size: 9px;
+  line-height: 1;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
 .brand-mark {
   width: 32px;
   height: 32px;
@@ -3040,4 +3058,98 @@ body.is-reordering-prompts * {
 .script-line-delete:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* Mobile browsers change the visible viewport as browser chrome opens/closes. */
+@media (max-width: 760px) {
+  .app-shell {
+    min-height: 100vh;
+    min-height: 100dvh;
+    overflow-x: clip;
+    overflow-y: visible;
+  }
+
+  .topbar {
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-left: max(18px, env(safe-area-inset-left, 0px));
+    padding-right: max(18px, env(safe-area-inset-right, 0px));
+  }
+
+  .workspace {
+    width: min(calc(100% - 32px), 620px);
+    padding-top: clamp(28px, 6vh, 48px);
+    padding-bottom: max(48px, env(safe-area-inset-bottom, 0px));
+  }
+
+  .folder-workspace {
+    min-width: 0;
+  }
+
+  .page-toolbar,
+  .folder-toolbar-actions {
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+
+  .run-panel.is-fullscreen,
+  .rehearsal-panel.is-fullscreen {
+    width: 100vw;
+    width: 100dvw;
+    height: 100vh;
+    height: 100dvh;
+    padding-top: max(16px, env(safe-area-inset-top, 0px));
+    padding-bottom: max(20px, env(safe-area-inset-bottom, 0px));
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+  }
+
+  .run-controls button,
+  .rehearsal-controls button,
+  .prompt-actions button,
+  .folder-actions button {
+    touch-action: manipulation;
+  }
+}
+
+@media (max-width: 520px) {
+  .page-toolbar {
+    align-items: flex-start;
+  }
+
+  .folder-toolbar-actions {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .folder-toolbar-actions > button {
+    flex: 1 1 auto;
+  }
+
+  .prompt-row {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .prompt-row .prompt-actions {
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .prompt-row .prompt-actions button,
+  .folder-actions button {
+    min-height: 40px;
+    padding: 8px;
+  }
+
+  .run-controls {
+    justify-content: center;
+  }
+
+  .run-controls .rehearsal-control,
+  .run-controls .run-with-me-button,
+  .rehearsal-controls .rehearsal-control,
+  .rehearsal-controls .run-with-me-button {
+    min-width: 40px;
+    min-height: 40px;
+  }
 }

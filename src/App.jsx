@@ -6,6 +6,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
 
 const DATABASE_NAME = 'prompt-library'
 const DATABASE_VERSION = 1
+const APP_VERSION = '1.0.0'
 
 let databasePromise
 const audioBoundsCache = new WeakMap()
@@ -2213,10 +2214,13 @@ function App() {
       isLightMode && 'theme-light',
     ].filter(Boolean).join(' ')}>
       <header className="topbar">
-        <button className="brand" type="button" onClick={() => { stopRun(); stopRehearsal(); setSelectedFolderId(null) }} aria-label="Prompt Library home">
-          <span className="brand-mark" aria-hidden="true">P<span>/</span></span>
-          <span className="brand-name">PROMPT<span>LIBRARY</span></span>
-        </button>
+        <div className="brand-group">
+          <button className="brand" type="button" onClick={() => { stopRun(); stopRehearsal(); setSelectedFolderId(null) }} aria-label="Prompt Library home">
+            <span className="brand-mark" aria-hidden="true">P<span>/</span></span>
+            <span className="brand-name">PROMPT<span>LIBRARY</span></span>
+          </button>
+          {!selectedFolder && <span className="app-version">v{APP_VERSION}</span>}
+        </div>
         <div className="topbar-tools">
           <div className="topbar-meta"><span className="status-dot" /> LOCAL ARCHIVE</div>
           <button
