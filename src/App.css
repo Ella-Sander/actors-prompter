@@ -1827,6 +1827,24 @@
   border-top: 1px solid var(--tone-303030);
 }
 
+.prompt-reorder-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 10px 4px 8px;
+  color: var(--tone-888);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.prompt-reorder-hint span {
+  color: var(--tone-ff6a00);
+  font-size: 16px;
+  line-height: 1;
+}
+
 .prompt-row {
   position: relative;
   min-height: 88px;
@@ -1836,23 +1854,40 @@
   gap: 22px;
   padding: 14px 0 14px 28px;
   border-top: 1px solid var(--tone-222);
-  cursor: grab;
+  cursor: default;
   touch-action: pan-y;
 }
 
 .prompt-drag-handle {
   position: absolute;
   top: 50%;
-  left: 3px;
+  left: 2px;
   display: grid;
-  width: 20px;
-  height: 36px;
+  width: 24px;
+  height: 42px;
   place-items: center;
   transform: translateY(-50%);
-  color: var(--tone-686868);
+  border: 1px solid color-mix(in srgb, var(--tone-686868) 35%, transparent);
+  border-radius: 7px;
+  color: var(--tone-888);
+  background: color-mix(in srgb, var(--tone-111) 85%, transparent);
   cursor: grab;
   touch-action: none;
   user-select: none;
+  transition: color 150ms ease, border-color 150ms ease, background-color 150ms ease, box-shadow 150ms ease;
+}
+
+.prompt-drag-handle > span {
+  font-size: 15px;
+  letter-spacing: -4px;
+  transform: translateX(-2px);
+}
+
+.prompt-row:hover .prompt-drag-handle,
+.prompt-row:focus-within .prompt-drag-handle {
+  color: var(--tone-ff6a00);
+  border-color: color-mix(in srgb, var(--tone-ff6a00) 55%, transparent);
+  background: color-mix(in srgb, var(--tone-ff6a00) 10%, var(--tone-111));
 }
 
 .prompt-row:active,
@@ -1861,7 +1896,18 @@
 }
 
 .prompt-row.is-dragging {
-  opacity: 0.55;
+  opacity: 0.88;
+  z-index: 2;
+  transform: scale(1.008);
+  border-color: var(--tone-ff6a00);
+  box-shadow: 0 8px 28px color-mix(in srgb, #000 28%, transparent), 0 0 0 1px color-mix(in srgb, var(--tone-ff6a00) 32%, transparent);
+  cursor: grabbing;
+}
+
+.prompt-row.is-dragging .prompt-drag-handle {
+  color: var(--tone-ff6a00);
+  border-color: var(--tone-ff6a00);
+  box-shadow: 0 0 14px color-mix(in srgb, var(--tone-ff6a00) 22%, transparent);
 }
 
 body.is-reordering-prompts,
@@ -1872,7 +1918,34 @@ body.is-reordering-prompts * {
 }
 
 .prompt-row.is-drag-over {
-  border-top-color: var(--tone-d8a94b);
+  border-color: color-mix(in srgb, var(--tone-ff6a00) 24%, var(--tone-414141));
+}
+
+.prompt-row.is-drop-before::before,
+.prompt-row.is-drop-after::after {
+  position: absolute;
+  z-index: 3;
+  right: 10px;
+  left: 10px;
+  height: 3px;
+  border-radius: 99px;
+  background: var(--tone-ff6a00);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--tone-ff6a00) 70%, transparent);
+  content: '';
+  pointer-events: none;
+}
+
+.prompt-row.is-drop-before::before {
+  top: -2px;
+}
+
+.prompt-row.is-drop-after::after {
+  bottom: -2px;
+}
+
+.prompt-row.is-reorder-disabled .prompt-drag-handle {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .prompt-row-silence {

@@ -1314,6 +1314,7 @@ function App() {
   const [characterName, setCharacterName] = useState('')
   const [draggedPromptId, setDraggedPromptId] = useState(null)
   const [dragOverPromptId, setDragOverPromptId] = useState(null)
+  const [dragDropPosition, setDragDropPosition] = useState('before')
   const activePlaybackRef = useRef(null)
   const pendingRunSkipRef = useRef(null)
   const runPausedRef = useRef(false)
@@ -1559,15 +1560,16 @@ function App() {
     savePrompt({ ...prompt, duration })
   }
 
-  async function reorderPrompts(draggedId, targetId) {
+  async function reorderPrompts(draggedId, targetId, position = 'before') {
     if (!draggedId || draggedId === targetId || runStatus || (rehearsalView && !['completed', 'error'].includes(rehearsalView.status))) return
     const ordered = [...folderPrompts]
     const draggedIndex = ordered.findIndex((prompt) => prompt.id === draggedId)
-    const targetIndex = ordered.findIndex((prompt) => prompt.id === targetId)
+    let targetIndex = ordered.findIndex((prompt) => prompt.id === targetId)
     if (draggedIndex < 0 || targetIndex < 0) return
 
     const [draggedPrompt] = ordered.splice(draggedIndex, 1)
-    ordered.splice(targetIndex, 0, draggedPrompt)
+    targetIndex = ordered.findIndex((prompt) => prompt.id === targetId)
+    ordered.splice(targetIndex + (position === 'after' ? 1 : 0), 0, draggedPrompt)
     const positioned = ordered.map((prompt, position) => ({ ...prompt, position }))
 
     try {
@@ -1591,7 +1593,7 @@ function App() {
     if (
       !canReorderPrompts ||
       event.button !== 0 ||
-      (event.pointerType === 'touch' && !dragHandle) ||
+      !dragHandle ||
       (event.target.closest('button, input, select, audio') && !dragHandle)
     ) return
     promptDragRef.current = { promptId, pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, active: false }
@@ -1608,17 +1610,26 @@ function App() {
     setDraggedPromptId(drag.promptId)
     const target = document.elementFromPoint(event.clientX, event.clientY)?.closest('[data-prompt-id]')
     setDragOverPromptId(target?.dataset.promptId ?? null)
+    if (target) {
+      const bounds = target.getBoundingClientRect()
+      setDragDropPosition(event.clientY >= bounds.top + bounds.height / 2 ? 'after' : 'before')
+    }
   }
 
   function finishPromptDrag(event) {
     const drag = promptDragRef.current
     if (!drag || drag.pointerId !== event.pointerId) return
     const target = document.elementFromPoint(event.clientX, event.clientY)?.closest('[data-prompt-id]')
-    if (drag.active && target) reorderPrompts(drag.promptId, target.dataset.promptId)
+    if (drag.active && target) {
+      const bounds = target.getBoundingClientRect()
+      const position = event.clientY >= bounds.top + bounds.height / 2 ? 'after' : 'before'
+      reorderPrompts(drag.promptId, target.dataset.promptId, position)
+    }
     promptDragRef.current = null
     document.body.classList.remove('is-reordering-prompts')
     setDraggedPromptId(null)
     setDragOverPromptId(null)
+    setDragDropPosition('before')
   }
 
   function cancelPromptDrag() {
@@ -1626,6 +1637,7 @@ function App() {
     document.body.classList.remove('is-reordering-prompts')
     setDraggedPromptId(null)
     setDragOverPromptId(null)
+    setDragDropPosition('before')
   }
 
   async function deleteFolder(folder) {
@@ -2947,6 +2959,9 @@ function App() {
               </div>
             ) : (
               <div className="prompt-list" aria-label="Prompts in chronological order">
+                {canReorderPrompts && (
+                  <p className="prompt-reorder-hint"><span aria-hidden="true">↕</span> Drag the grip to reorder prompts</p>
+                )}
                 {folderPrompts.map((prompt, index) => (
                   <article
                     className={[
@@ -2955,6 +2970,8 @@ function App() {
                       prompt.type !== 'silence' && !isUsableRecording(prompt.audio) && 'prompt-row-no-audio',
                       draggedPromptId === prompt.id && 'is-dragging',
                       dragOverPromptId === prompt.id && draggedPromptId !== prompt.id && 'is-drag-over',
+                      dragOverPromptId === prompt.id && draggedPromptId !== prompt.id && `is-drop-${dragDropPosition}`,
+                      !canReorderPrompts && 'is-reorder-disabled',
                     ].filter(Boolean).join(' ')}
                     key={prompt.id}
                     data-prompt-id={prompt.id}
@@ -2963,7 +2980,15 @@ function App() {
                     onPointerUp={finishPromptDrag}
                     onPointerCancel={cancelPromptDrag}
                   >
-                    <span className="prompt-drag-handle" data-prompt-drag-handle aria-hidden="true">{'\u22EE\u22EE'}</span>
+                    <span
+                      className="prompt-drag-handle"
+                      data-prompt-drag-handle
+                      role="img"
+                      aria-label={canReorderPrompts ? 'Drag to reorder prompt' : 'Reordering unavailable during a run'}
+                      title={canReorderPrompts ? 'Drag to reorder' : 'Reordering unavailable during a run'}
+                    >
+                      <span aria-hidden="true">{'\u22EE\u22EE'}</span>
+                    </span>
                     <div className="prompt-info">
                       <h3>{formatPromptLabel(prompt, index + 1)}</h3>
                       {prompt.type === 'silence' ? (
