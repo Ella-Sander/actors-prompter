@@ -958,22 +958,32 @@ function App() {
 
   useEffect(() => {
     const handleFullscreenChange = () => {
-      setIsTeleprompterFullscreen(document.fullscreenElement === rehearsalPanelRef.current)
-      setIsRunPrompterFullscreen(document.fullscreenElement === runPrompterRef.current)
+      setIsTeleprompterFullscreen(Boolean(rehearsalPanelRef.current && document.fullscreenElement === rehearsalPanelRef.current))
+      setIsRunPrompterFullscreen(Boolean(runPrompterRef.current && document.fullscreenElement === runPrompterRef.current))
     }
     document.addEventListener('fullscreenchange', handleFullscreenChange)
     return () => document.removeEventListener('fullscreenchange', handleFullscreenChange)
   }, [])
 
   useEffect(() => {
-    if (!runStatus && document.fullscreenElement === runPrompterRef.current) {
-      document.exitFullscreen().catch(() => {})
+    if (!runStatus) {
+      const panel = runPrompterRef.current
+      if (panel && document.fullscreenElement === panel && typeof document.exitFullscreen === 'function') {
+        Promise.resolve(document.exitFullscreen()).catch(() => {})
+      } else {
+        setIsRunPrompterFullscreen(false)
+      }
     }
   }, [runStatus])
 
   useEffect(() => {
-    if (!isRehearsalRunning && document.fullscreenElement === rehearsalPanelRef.current) {
-      document.exitFullscreen().catch(() => {})
+    if (!isRehearsalRunning) {
+      const panel = rehearsalPanelRef.current
+      if (panel && document.fullscreenElement === panel && typeof document.exitFullscreen === 'function') {
+        Promise.resolve(document.exitFullscreen()).catch(() => {})
+      } else {
+        setIsTeleprompterFullscreen(false)
+      }
     }
   }, [isRehearsalRunning])
 
@@ -1271,15 +1281,32 @@ function App() {
   }
 
   async function toggleRunPrompterFullscreen() {
-    if (document.fullscreenElement === runPrompterRef.current) {
-      await document.exitFullscreen().catch(() => {})
+    const panel = runPrompterRef.current
+    if (!panel) return
+
+    if (document.fullscreenElement === panel) {
+      if (typeof document.exitFullscreen === 'function') {
+        await Promise.resolve(document.exitFullscreen()).catch(() => {})
+      } else {
+        setIsRunPrompterFullscreen(false)
+      }
+      return
+    }
+
+    if (isRunPrompterFullscreen) {
+      setIsRunPrompterFullscreen(false)
+      return
+    }
+
+    if (typeof panel.requestFullscreen !== 'function') {
+      setIsRunPrompterFullscreen(true)
       return
     }
 
     try {
-      await runPrompterRef.current?.requestFullscreen?.()
+      await panel.requestFullscreen()
     } catch {
-      return
+      setIsRunPrompterFullscreen(true)
     }
   }
 
@@ -1788,15 +1815,32 @@ function App() {
   }
 
   async function toggleTeleprompterFullscreen() {
-    if (document.fullscreenElement === rehearsalPanelRef.current) {
-      await document.exitFullscreen().catch(() => {})
+    const panel = rehearsalPanelRef.current
+    if (!panel) return
+
+    if (document.fullscreenElement === panel) {
+      if (typeof document.exitFullscreen === 'function') {
+        await Promise.resolve(document.exitFullscreen()).catch(() => {})
+      } else {
+        setIsTeleprompterFullscreen(false)
+      }
+      return
+    }
+
+    if (isTeleprompterFullscreen) {
+      setIsTeleprompterFullscreen(false)
+      return
+    }
+
+    if (typeof panel.requestFullscreen !== 'function') {
+      setIsTeleprompterFullscreen(true)
       return
     }
 
     try {
-      await rehearsalPanelRef.current?.requestFullscreen?.()
+      await panel.requestFullscreen()
     } catch {
-      return
+      setIsTeleprompterFullscreen(true)
     }
   }
 
