@@ -10,6 +10,22 @@ const audioBoundsCache = new WeakMap()
 let ttsModelPromise
 let ttsFetchTraceState
 
+function recordRehearsalTrace(session, event, details = {}) {
+  if (typeof window === 'undefined') return
+  const entry = {
+    time: new Date().toISOString(),
+    event,
+    phase: session?.phase ?? 'none',
+    prompt: session ? `${session.index + 1}/${session.lines.length}` : 'none',
+    promptId: session?.lines?.[session.index]?.id ?? null,
+    ...details,
+  }
+  window.__promptRehearsalTrace ??= []
+  window.__promptRehearsalTrace.push(entry)
+  if (window.__promptRehearsalTrace.length > 40) window.__promptRehearsalTrace.shift()
+  console.info('[Run With Me trace]', entry)
+}
+
 function recordTtsTrace(event, details = {}) {
   if (typeof window === 'undefined') return
   const entry = { time: new Date().toISOString(), event, ...details }
@@ -1509,6 +1525,16 @@ function App() {
   function updateRehearsalView(session, status = session.phase) {
     if (rehearsalSessionRef.current !== session) return
     const line = session.lines[session.index]
+    const traceKey = `${status}:${session.index}:${line?.id ?? 'none'}`
+    if (session.lastTraceKey !== traceKey) {
+      session.lastTraceKey = traceKey
+      recordRehearsalTrace(session, 'phase', { status, speaker: line?.speaker ?? line?.type ?? 'none' })
+    }
+    window.__promptRehearsalRuntime = {
+      phase: status,
+      prompt: `${Math.max(0, session.index + 1)}/${session.lines.length}`,
+      speaker: line?.speaker ?? line?.type ?? 'none',
+    }
     const showMyselfWordFollow = line?.speaker === 'Myself' && ['listening', 'speech-end', 'paused'].includes(status)
     setRehearsalView({
       status,
@@ -1537,6 +1563,7 @@ function App() {
 
   function failRehearsal(session, message) {
     if (rehearsalSessionRef.current !== session) return
+    recordRehearsalTrace(session, 'rehearsal-failed', { message })
     disposeRehearsalSession(session)
     session.phase = 'error'
     session.message = message
@@ -1753,6 +1780,7 @@ function App() {
     recognition.maxAlternatives = 1
     recognition.lang = 'en-US'
     session.recognition = recognition
+    recordRehearsalTrace(session, 'recognition-created')
 
     recognition.onresult = (event) => {
       if (rehearsalSessionRef.current !== session || session.recognition !== recognition || !['listening', 'speech-end', 'paused'].includes(session.phase)) return
@@ -1817,6 +1845,7 @@ function App() {
     }
 
     recognition.onerror = (event) => {
+      recordRehearsalTrace(session, 'recognition-error', { error: event.error ?? 'unknown' })
       if (rehearsalSessionRef.current !== session || session.recognition !== recognition || !['listening', 'speech-end'].includes(session.phase)) return
       if (event.error === 'no-speech') {
         session.message = 'No speech detected. Keep speaking or try the line again.'
@@ -1830,6 +1859,7 @@ function App() {
     }
 
     recognition.onend = () => {
+      recordRehearsalTrace(session, 'recognition-ended')
       if (rehearsalSessionRef.current !== session || session.recognition !== recognition) return
       session.recognition = null
       session.committedTranscript = [session.committedTranscript, session.currentFinalTranscript].filter(Boolean).join(' ')
@@ -1852,6 +1882,7 @@ function App() {
 
     try {
       recognition.start()
+      recordRehearsalTrace(session, 'recognition-started')
     } catch {
       failRehearsal(session, 'Could not start speech recognition. Restart rehearsal to try again.')
     }
@@ -1918,6 +1949,7 @@ function App() {
     }
     audio.onended = finishPlayback
     audio.onerror = () => {
+      recordRehearsalTrace(session, 'reader-audio-error', { mediaErrorCode: audio.error?.code ?? null })
       if (rehearsalSessionRef.current !== session || session.readerAudio !== playback || session.phase !== 'speaking') return
       failRehearsal(session, `The Reader recording ${formatPromptLabel(line, session.index + 1)} could not be played.`)
     }
@@ -1940,12 +1972,20 @@ function App() {
       updateRehearsalView(session, 'speaking')
       try {
         audio.play().catch(() => {
+          recordRehearsalTrace(session, 'reader-audio-play-rejected')
           if (rehearsalSessionRef.current === session && session.readerAudio === playback && session.phase === 'speaking') {
             failRehearsal(session, 'Reader playback was interrupted. Restart rehearsal to try again.')
           }
         })
       } catch {
         failRehearsal(session, 'Reader playback could not be started. Restart rehearsal to try again.')
+      }
+    }).catch((error) => {
+      recordRehearsalTrace(session, 'reader-audio-prepare-failed', {
+        error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+      })
+      if (rehearsalSessionRef.current === session && session.readerAudio === playback) {
+        failRehearsal(session, `Reader recording ${formatPromptLabel(line, session.index + 1)} could not be prepared: ${error?.message || 'unknown audio error'}`)
       }
     })
   }
@@ -2005,6 +2045,7 @@ function App() {
       message: '',
     }
     rehearsalSessionRef.current = session
+    recordRehearsalTrace(session, 'rehearsal-started', { lineCount: session.lines.length })
     if (session.lines.length === 0) {
       failRehearsal(session, 'Add prompts to this folder before starting rehearsal.')
       return

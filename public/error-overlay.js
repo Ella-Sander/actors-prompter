@@ -13,6 +13,13 @@
           return `${time} ${event}${Object.keys(data).length ? ` ${JSON.stringify(data)}` : ''}`
         }).join('\n')
       : ''
+    const rehearsalTrace = Array.isArray(window.__promptRehearsalTrace)
+      ? window.__promptRehearsalTrace.slice(-24).map((entry) => {
+          const { time, event, ...data } = entry
+          return `${time} ${event}${Object.keys(data).length ? ` ${JSON.stringify(data)}` : ''}`
+        }).join('\n')
+      : ''
+    const rehearsalRuntime = window.__promptRehearsalRuntime
 
     const screen = document.createElement('main')
     screen.id = 'runtime-error-overlay'
@@ -28,6 +35,8 @@
     const output = document.createElement('pre')
     output.textContent = [
       details || 'No additional error details were provided by the browser.',
+      rehearsalRuntime && `\nRun With Me state:\n${JSON.stringify(rehearsalRuntime)}`,
+      rehearsalTrace && `\nRecent Run With Me trace:\n${rehearsalTrace}`,
       ttsTrace && `\nRecent TTS trace:\n${ttsTrace}`,
     ].filter(Boolean).join('\n')
 
@@ -65,7 +74,7 @@
       ? [
           'The browser did not expose the script filename, line, or exception object, so this message cannot identify the failing code.',
           `Page: ${window.location.origin}`,
-          'Check the recent TTS trace below if this happened during voice generation. A missing trace means the error occurred before TTS started.',
+          'Check the Run With Me or TTS trace below to see which feature was active when this happened.',
         ].join('\n')
       : [location, describeError(event.error)].filter(Boolean).join('\n')
     showError(event.message || 'Uncaught JavaScript error.', details)
