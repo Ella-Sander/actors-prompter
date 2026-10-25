@@ -1,0 +1,30 @@
+#runtime-error-overlay {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 2147483647 !important;
+  box-sizing: border-box !important;
+  overflow: auto !important;
+  padding: 24px !important;
+  background: #fff !important;
+  color: #111 !important;
+  font: 14px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace !important;
+  white-space: pre-wrap !important;
+  overflow-wrap: anywhere !important;
+}
+
+#runtime-error-overlay h1 {
+  margin: 0 0 16px;
+  font: 600 18px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+#runtime-error-overlay p {
+  margin: 0 0 12px;
+  font-weight: 700;
+}
+
+#runtime-error-overlay pre {
+  margin: 0;
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

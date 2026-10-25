@@ -3060,6 +3060,32 @@ body.is-reordering-prompts * {
   cursor: not-allowed;
 }
 
+.react-render-error {
+  position: fixed;
+  z-index: 2147483646;
+  inset: 0;
+  overflow: auto;
+  box-sizing: border-box;
+  padding: 24px;
+  background: #fff;
+  color: #111;
+  font: 14px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.react-render-error h1 {
+  margin: 0 0 16px;
+  font-size: 18px;
+}
+
+.react-render-error pre {
+  margin: 0;
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* Mobile browsers change the visible viewport as browser chrome opens/closes. */
 @media (max-width: 760px) {
   .app-shell {
