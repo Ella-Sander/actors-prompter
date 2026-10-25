@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
+import ortWasmModuleUrl from '../node_modules/kokoro-js/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.mjs?url'
+import ortWasmBinaryUrl from '../node_modules/kokoro-js/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.wasm?url'
 import './App.css'
 
 const DATABASE_NAME = 'prompt-library'
@@ -142,8 +144,10 @@ async function generateTtsAudio(text) {
   try {
     ensureReadableStreamAsyncIterator()
     recordTtsTrace('module-import-start')
-    const { KokoroTTS } = await import('kokoro-js')
+    const { KokoroTTS, env: kokoroEnv } = await import('kokoro-js')
     recordTtsTrace('module-import-ready')
+    kokoroEnv.wasmPaths = { mjs: ortWasmModuleUrl, wasm: ortWasmBinaryUrl }
+    recordTtsTrace('runtime-assets-configured', { module: ortWasmModuleUrl, wasm: ortWasmBinaryUrl })
     if (!ttsModelPromise) {
       recordTtsTrace('model-load-start', { model: 'onnx-community/Kokoro-82M-v1.0-ONNX', dtype: 'q8', device: 'wasm' })
       const modelPromise = KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-v1.0-ONNX', {
