@@ -20,6 +20,12 @@
         }).join('\n')
       : ''
     const rehearsalRuntime = window.__promptRehearsalRuntime
+    const recordingTrace = Array.isArray(window.__promptRecordingTrace)
+      ? window.__promptRecordingTrace.slice(-24).map((entry) => {
+          const { time, event, ...data } = entry
+          return `${time} ${event}${Object.keys(data).length ? ` ${JSON.stringify(data)}` : ''}`
+        }).join('\n')
+      : ''
 
     const screen = document.createElement('main')
     screen.id = 'runtime-error-overlay'
@@ -37,6 +43,7 @@
       details || 'No additional error details were provided by the browser.',
       rehearsalRuntime && `\nRun With Me state:\n${JSON.stringify(rehearsalRuntime)}`,
       rehearsalTrace && `\nRecent Run With Me trace:\n${rehearsalTrace}`,
+      recordingTrace && `\nRecent prompt recording trace:\n${recordingTrace}`,
       ttsTrace && `\nRecent TTS trace:\n${ttsTrace}`,
     ].filter(Boolean).join('\n')
 

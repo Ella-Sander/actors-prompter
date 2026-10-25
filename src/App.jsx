@@ -35,6 +35,13 @@ function recordTtsTrace(event, details = {}) {
   console.info('[Prompt TTS trace]', entry)
 }
 
+function recordPromptRecordingTrace(event, details = {}) {
+  if (typeof window === 'undefined') return
+  const entries = window.__promptRecordingTrace ??= []
+  entries.push({ time: new Date().toISOString(), event, ...details })
+  if (entries.length > 30) entries.shift()
+}
+
 function safeFetchTarget(input) {
   try {
     const requestUrl = typeof input === 'string' || input instanceof URL ? input : input.url
@@ -756,6 +763,7 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
   const [transcriptNotice, setTranscriptNotice] = useState('')
   const [transcriptError, setTranscriptError] = useState('')
   const [recording, setRecording] = useState(false)
+  const [recordingStarting, setRecordingStarting] = useState(false)
   const [seconds, setSeconds] = useState(0)
   const [error, setError] = useState('')
   const [generationError, setGenerationError] = useState('')
@@ -763,6 +771,8 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
   const recorderRef = useRef(null)
   const recognitionRef = useRef(null)
   const chunksRef = useRef([])
+  const recordingFailedRef = useRef(false)
+  const recordingStartingRef = useRef(false)
 
   useEffect(() => {
     if (!recording) return undefined
@@ -778,72 +788,128 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
   }, [])
 
   async function startRecording() {
+    if (recordingStartingRef.current || recorderRef.current?.state === 'recording') return
+    recordingStartingRef.current = true
+    setRecordingStarting(true)
     setError('')
-    setAudio(null)
-    setAudioSource(null)
     setTranscriptNotice('')
     setTranscriptError('')
     setSeconds(0)
 
     if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+      recordPromptRecordingTrace('unsupported', {
+        mediaDevices: Boolean(navigator.mediaDevices),
+        getUserMedia: Boolean(navigator.mediaDevices?.getUserMedia),
+        mediaRecorder: Boolean(window.MediaRecorder),
+      })
       setError('Audio recording is not supported in this browser.')
+      recordingStartingRef.current = false
+      setRecordingStarting(false)
       return
-    }
-
-    const SpeechRecognitionApi = window.SpeechRecognition || window.webkitSpeechRecognition
-    if (SpeechRecognitionApi) {
-      const recognition = new SpeechRecognitionApi()
-      recognition.continuous = true
-      recognition.interimResults = true
-      recognition.lang = 'en-US'
-      recognition.onresult = (event) => {
-        const spokenWords = Array.from(event.results)
-          .map((result) => result[0].transcript)
-          .join(' ')
-          .trim()
-        setTranscript(spokenWords)
-      }
-      recognition.onerror = () => {
-        setTranscriptNotice('TRANSCRIPTION INTERRUPTED')
-      }
-      recognitionRef.current = recognition
-      try {
-        recognition.start()
-      } catch {
-        setTranscriptNotice('TRANSCRIPTION UNAVAILABLE')
-      }
-    } else {
-      setTranscriptNotice('TYPE AN ENGLISH TRANSCRIPT')
     }
 
     let stream
     try {
+      recordPromptRecordingTrace('microphone-requested', { promptId: prompt?.id ?? 'new' })
       stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      const recorder = new MediaRecorder(stream)
+      recordPromptRecordingTrace('microphone-ready', { trackCount: stream.getAudioTracks().length })
+      const supportedMimeType = [
+        'audio/mp4;codecs=mp4a.40.2',
+        'audio/mp4',
+        'audio/webm;codecs=opus',
+        'audio/webm',
+      ].find((type) => MediaRecorder.isTypeSupported?.(type))
+      const recorder = supportedMimeType
+        ? new MediaRecorder(stream, { mimeType: supportedMimeType })
+        : new MediaRecorder(stream)
       chunksRef.current = []
+      recordingFailedRef.current = false
       recorderRef.current = recorder
       recorder.ondataavailable = (event) => {
         if (event.data.size > 0) chunksRef.current.push(event.data)
       }
       recorder.onstop = () => {
-        const clip = new Blob(chunksRef.current, { type: recorder.mimeType || 'audio/webm' })
-        if (clip.size > 0) setAudio(clip)
-        if (clip.size > 0) setAudioSource('user')
+        const clip = new Blob(chunksRef.current, { type: recorder.mimeType || supportedMimeType || 'audio/webm' })
+        recordPromptRecordingTrace('recorder-stopped', { bytes: clip.size, failed: recordingFailedRef.current })
+        if (clip.size > 0 && !recordingFailedRef.current) {
+          setAudio(clip)
+          setAudioSource('user')
+        } else if (!recordingFailedRef.current) {
+          setError('No audio was captured. Check microphone access and try recording again.')
+        }
+        stream.getTracks().forEach((track) => track.stop())
+        if (recorderRef.current === recorder) recorderRef.current = null
+        setRecording(false)
+      }
+      recorder.onerror = () => {
+        recordingFailedRef.current = true
+        recordPromptRecordingTrace('recorder-error', { state: recorder.state, mimeType: recorder.mimeType || 'unknown' })
+        setError('The recording stopped unexpectedly. Your previous audio is still available; please try again.')
         stream.getTracks().forEach((track) => track.stop())
         setRecording(false)
       }
       recorder.start()
       setRecording(true)
-    } catch {
+      recordPromptRecordingTrace('recorder-started', { mimeType: recorder.mimeType || supportedMimeType || 'browser-default' })
+
+      // Start optional transcription only after the microphone recorder is running.
+      // Safari can reject SpeechRecognition independently; that must not cancel audio capture.
+      const SpeechRecognitionApi = window.SpeechRecognition || window.webkitSpeechRecognition
+      if (SpeechRecognitionApi) {
+        try {
+          const recognition = new SpeechRecognitionApi()
+          recognition.continuous = true
+          recognition.interimResults = true
+          recognition.lang = 'en-US'
+          recognition.onresult = (event) => {
+            const spokenWords = Array.from(event.results)
+              .map((result) => result[0].transcript)
+              .join(' ')
+              .trim()
+            setTranscript(spokenWords)
+          }
+          recognition.onerror = (event) => {
+            recordPromptRecordingTrace('transcription-error', { error: event.error ?? 'unknown' })
+            setTranscriptNotice('TRANSCRIPTION INTERRUPTED — RECORDING CONTINUES')
+          }
+          recognitionRef.current = recognition
+          recognition.start()
+          recordPromptRecordingTrace('transcription-started')
+        } catch {
+          recognitionRef.current = null
+          recordPromptRecordingTrace('transcription-start-failed')
+          setTranscriptNotice('TYPE AN ENGLISH TRANSCRIPT')
+        }
+      } else {
+        setTranscriptNotice('TYPE AN ENGLISH TRANSCRIPT')
+      }
+    } catch (recordingError) {
+      recordPromptRecordingTrace('recorder-start-failed', {
+        error: recordingError instanceof Error ? `${recordingError.name}: ${recordingError.message}` : String(recordingError),
+      })
       stream?.getTracks().forEach((track) => track.stop())
       recognitionRef.current?.abort()
+      recognitionRef.current = null
+      recorderRef.current = null
+      setRecording(false)
       setError('Microphone access was unavailable. Allow microphone access and try again.')
+    } finally {
+      recordingStartingRef.current = false
+      setRecordingStarting(false)
     }
   }
 
   function stopRecording() {
-    recognitionRef.current?.stop()
-    if (recorderRef.current?.state === 'recording') recorderRef.current.stop()
+    const recognition = recognitionRef.current
+    recognitionRef.current = null
+    try {
+      recognition?.stop()
+    } catch {
+      // Recognition is optional; stopping the audio recorder remains authoritative.
+    }
+    const recorder = recorderRef.current
+    recordPromptRecordingTrace('stop-requested', { recorderState: recorder?.state ?? 'missing' })
+    if (recorder?.state === 'recording') recorder.stop()
   }
 
   async function submitPrompt(event) {
@@ -938,9 +1004,9 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
               <span>{recording ? 'Recording in progress' : audio ? (audioSource === 'tts' ? 'Default voice ready' : 'Recording ready') : 'Ready to record'}</span>
               <span className="recording-time">{formatTime(seconds)}</span>
             </div>
-            <button className={recording ? 'record-button is-recording' : 'record-button'} type="button" onClick={recording ? stopRecording : startRecording}>
+            <button className={recording ? 'record-button is-recording' : 'record-button'} type="button" onClick={recording ? stopRecording : startRecording} disabled={recordingStarting}>
               <span className="record-button-icon" aria-hidden="true">{recording ? '\u25A0' : '\u25CF'}</span>
-              {recording ? 'Stop recording' : audio ? 'Record again' : 'Start recording'}
+              {recording ? 'Stop recording' : recordingStarting ? 'Starting…' : audio ? 'Record again' : 'Start recording'}
             </button>
             {audio && !recording && <AudioPlayer audio={audio} trimSilence={trimSilence} />}
             {error && <p className="form-error" role="alert">{error}</p>}
