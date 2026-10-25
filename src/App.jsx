@@ -9,7 +9,29 @@ let databasePromise
 const audioBoundsCache = new WeakMap()
 let ttsModelPromise
 
+function ensureReadableStreamAsyncIterator() {
+  const streamPrototype = globalThis.ReadableStream?.prototype
+  if (!streamPrototype || Symbol.asyncIterator in streamPrototype) return
+
+  Object.defineProperty(streamPrototype, Symbol.asyncIterator, {
+    configurable: true,
+    value: async function* iterateReadableStream() {
+      const reader = this.getReader()
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) return
+          yield value
+        }
+      } finally {
+        reader.releaseLock()
+      }
+    },
+  })
+}
+
 async function generateTtsAudio(text) {
+  ensureReadableStreamAsyncIterator()
   const { KokoroTTS } = await import('kokoro-js')
   if (!ttsModelPromise) {
     const modelPromise = KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-ONNX', {
