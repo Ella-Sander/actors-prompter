@@ -20,6 +20,7 @@
         }).join('\n')
       : ''
     const rehearsalRuntime = window.__promptRehearsalRuntime
+    const ttsStatus = window.__promptLibraryTtsStatus
     const recordingTrace = Array.isArray(window.__promptRecordingTrace)
       ? window.__promptRecordingTrace.slice(-24).map((entry) => {
           const { time, event, ...data } = entry
@@ -41,6 +42,7 @@
     const output = document.createElement('pre')
     output.textContent = [
       details || 'No additional error details were provided by the browser.',
+      ttsStatus && `\nTTS runtime status:\n${JSON.stringify(ttsStatus)}`,
       rehearsalRuntime && `\nRun With Me state:\n${JSON.stringify(rehearsalRuntime)}`,
       rehearsalTrace && `\nRecent Run With Me trace:\n${rehearsalTrace}`,
       recordingTrace && `\nRecent prompt recording trace:\n${recordingTrace}`,
@@ -76,6 +78,15 @@
     const location = event.filename
       ? `${event.filename}${event.lineno ? `:${event.lineno}` : ''}${event.colno ? `:${event.colno}` : ''}`
       : ''
+    window.__promptLibraryTtsTrace ??= []
+    window.__promptLibraryTtsTrace.push({
+      time: new Date().toISOString(),
+      event: 'window-error',
+      message: event.message || 'Unknown window error',
+      location: location || null,
+      hasException: Boolean(event.error),
+      ttsStatus: window.__promptLibraryTtsStatus ?? null,
+    })
     const isOpaqueScriptError = event.message === 'Script error.' && !event.filename && !event.error
     const details = isOpaqueScriptError
       ? [
@@ -98,6 +109,16 @@
       event.sourceFile && `Source: ${event.sourceFile}${event.lineNumber ? `:${event.lineNumber}` : ''}`,
       event.sample && `Sample: ${event.sample}`,
     ].filter(Boolean).join('\n')
+    window.__promptLibraryTtsTrace ??= []
+    window.__promptLibraryTtsTrace.push({
+      time: new Date().toISOString(),
+      event: 'csp-violation',
+      directive: event.effectiveDirective || 'unknown',
+      blockedURI: event.blockedURI || 'unknown',
+      sourceFile: event.sourceFile || null,
+      lineNumber: event.lineNumber || null,
+      ttsStatus: window.__promptLibraryTtsStatus ?? null,
+    })
     showError('The browser blocked a resource or JavaScript operation under the site’s Content Security Policy.', details)
   })
 })()

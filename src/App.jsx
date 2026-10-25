@@ -34,7 +34,33 @@ function recordTtsTrace(event, details = {}) {
   window.__promptLibraryTtsTrace ??= []
   window.__promptLibraryTtsTrace.push(entry)
   if (window.__promptLibraryTtsTrace.length > 60) window.__promptLibraryTtsTrace.shift()
+  window.__promptLibraryTtsStatus = { event, time: entry.time, ...details }
   console.info('[Prompt TTS trace]', entry)
+}
+
+function getWasmRuntimeCapabilities() {
+  const simdProbe = new Uint8Array([
+    0, 97, 115, 109, 1, 0, 0, 0,
+    1, 5, 1, 96, 0, 1, 123,
+    3, 2, 1, 0,
+    10, 22, 1, 20, 0, 253, 12,
+    ...new Array(16).fill(0), 11,
+  ])
+  let sharedMemory = false
+  try {
+    sharedMemory = typeof SharedArrayBuffer !== 'undefined'
+      && new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }) instanceof WebAssembly.Memory
+  } catch {
+    sharedMemory = false
+  }
+  return {
+    secureContext: window.isSecureContext,
+    crossOriginIsolated: window.crossOriginIsolated,
+    sharedArrayBuffer: typeof SharedArrayBuffer !== 'undefined',
+    sharedMemory,
+    wasm: typeof WebAssembly !== 'undefined',
+    wasmSimd: typeof WebAssembly !== 'undefined' && WebAssembly.validate(simdProbe),
+  }
 }
 
 function recordPromptRecordingTrace(event, details = {}) {
@@ -86,7 +112,10 @@ function startTtsFetchTrace() {
           method,
           target,
           status: response.status,
+          ok: response.ok,
           responseType: response.type,
+          contentType: response.headers.get('content-type'),
+          contentLength: response.headers.get('content-length'),
           finalTarget: safeFetchTarget(response.url || target),
         })
         return response
@@ -148,8 +177,24 @@ async function generateTtsAudio(text) {
     recordTtsTrace('module-import-ready')
     kokoroEnv.wasmPaths = { mjs: ortWasmModuleUrl, wasm: ortWasmBinaryUrl }
     recordTtsTrace('runtime-assets-configured', { module: ortWasmModuleUrl, wasm: ortWasmBinaryUrl })
+    const runtimeCapabilities = getWasmRuntimeCapabilities()
+    recordTtsTrace('runtime-capabilities', runtimeCapabilities)
+    if (!runtimeCapabilities.wasm) {
+      throw new Error('This browser does not support WebAssembly, which the default voice requires.')
+    }
+    if (!runtimeCapabilities.wasmSimd) {
+      throw new Error('This browser does not support the SIMD WebAssembly runtime bundled with the default voice.')
+    }
+    if (!runtimeCapabilities.sharedMemory) {
+      throw new Error('The page is not cross-origin isolated, so the threaded WebAssembly voice runtime cannot start. Reload after the site enables COOP and COEP headers.')
+    }
     if (!ttsModelPromise) {
-      recordTtsTrace('model-load-start', { model: 'onnx-community/Kokoro-82M-v1.0-ONNX', dtype: 'q8', device: 'wasm' })
+      recordTtsTrace('model-load-start', {
+        model: 'onnx-community/Kokoro-82M-v1.0-ONNX',
+        dtype: 'q8',
+        device: 'wasm',
+        runtime: runtimeCapabilities,
+      })
       const modelPromise = KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-v1.0-ONNX', {
         dtype: 'q8',
         device: 'wasm',
@@ -161,6 +206,10 @@ async function generateTtsAudio(text) {
         }),
       })
       const retryableModelPromise = modelPromise.catch((error) => {
+        recordTtsTrace('model-load-failed', {
+          error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+        })
         if (ttsModelPromise === retryableModelPromise) ttsModelPromise = undefined
         throw error
       })
@@ -178,6 +227,7 @@ async function generateTtsAudio(text) {
   } catch (error) {
     recordTtsTrace('generation-failed', {
       error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
     })
     throw error
   } finally {
