@@ -1,8 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import * as pdfjsLib from 'pdfjs-dist'
-import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import './App.css'
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
 
 const DATABASE_NAME = 'prompt-library'
 const DATABASE_VERSION = 1
@@ -36,6 +33,11 @@ function isCharacterCue(line) {
 }
 
 async function extractScriptLines(file) {
+  const [pdfjsLib, pdfWorker] = await Promise.all([
+    import('pdfjs-dist'),
+    import('pdfjs-dist/build/pdf.worker.min.mjs?url'),
+  ])
+  pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker.default
   const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise
   const lines = []
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
