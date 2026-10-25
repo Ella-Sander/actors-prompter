@@ -52,15 +52,34 @@ function safeFetchTarget(input) {
   }
 }
 
+function routeKokoroAssetThroughWorker(input) {
+  try {
+    const sourceUrl = typeof input === 'string' || input instanceof URL ? new URL(input, window.location.href) : new URL(input.url)
+    const modelPrefix = '/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/'
+    if (sourceUrl.origin !== 'https://huggingface.co' || !sourceUrl.pathname.startsWith(modelPrefix)) return input
+
+    const assetPath = sourceUrl.pathname.slice(modelPrefix.length)
+    const proxyUrl = new URL(`/api/kokoro/${assetPath}`, window.location.origin)
+    proxyUrl.search = sourceUrl.search
+    return typeof Request !== 'undefined' && input instanceof Request
+      ? new Request(proxyUrl, input)
+      : proxyUrl.href
+  } catch {
+    return input
+  }
+}
+
 function startTtsFetchTrace() {
   if (!ttsFetchTraceState) {
     const originalFetch = globalThis.fetch
     const tracedFetch = async (input, init) => {
-      const target = safeFetchTarget(input)
+      const routedInput = routeKokoroAssetThroughWorker(input)
+      const target = safeFetchTarget(routedInput)
+      const upstreamTarget = safeFetchTarget(input)
       const method = init?.method ?? (typeof Request !== 'undefined' && input instanceof Request ? input.method : 'GET')
-      recordTtsTrace('fetch-start', { method, target })
+      recordTtsTrace('fetch-start', { method, target, ...(target !== upstreamTarget ? { upstreamTarget } : {}) })
       try {
-        const response = await originalFetch.call(globalThis, input, init)
+        const response = await originalFetch.call(globalThis, routedInput, init)
         recordTtsTrace('fetch-response', {
           method,
           target,
