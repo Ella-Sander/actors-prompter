@@ -7,6 +7,13 @@
     overlayShown = true
     errorNumber += 1
 
+    const ttsTrace = Array.isArray(window.__promptLibraryTtsTrace)
+      ? window.__promptLibraryTtsTrace.slice(-24).map((entry) => {
+          const { time, event, ...data } = entry
+          return `${time} ${event}${Object.keys(data).length ? ` ${JSON.stringify(data)}` : ''}`
+        }).join('\n')
+      : ''
+
     const screen = document.createElement('main')
     screen.id = 'runtime-error-overlay'
     screen.className = 'runtime-error-overlay'
@@ -19,7 +26,10 @@
     message.textContent = title
 
     const output = document.createElement('pre')
-    output.textContent = details || 'No additional error details were provided by the browser.'
+    output.textContent = [
+      details || 'No additional error details were provided by the browser.',
+      ttsTrace && `\nRecent TTS trace:\n${ttsTrace}`,
+    ].filter(Boolean).join('\n')
 
     screen.append(heading, message, output)
     document.body.replaceChildren(screen)

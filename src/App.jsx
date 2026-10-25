@@ -8,6 +8,70 @@ const APP_VERSION = '1.0.0'
 let databasePromise
 const audioBoundsCache = new WeakMap()
 let ttsModelPromise
+let ttsFetchTraceState
+
+function recordTtsTrace(event, details = {}) {
+  if (typeof window === 'undefined') return
+  const entry = { time: new Date().toISOString(), event, ...details }
+  window.__promptLibraryTtsTrace ??= []
+  window.__promptLibraryTtsTrace.push(entry)
+  if (window.__promptLibraryTtsTrace.length > 60) window.__promptLibraryTtsTrace.shift()
+  console.info('[Prompt TTS trace]', entry)
+}
+
+function safeFetchTarget(input) {
+  try {
+    const requestUrl = typeof input === 'string' || input instanceof URL ? input : input.url
+    const url = new URL(requestUrl, window.location.href)
+    return `${url.origin}${url.pathname}`
+  } catch {
+    return 'unknown URL'
+  }
+}
+
+function startTtsFetchTrace() {
+  if (!ttsFetchTraceState) {
+    const originalFetch = globalThis.fetch
+    const tracedFetch = async (input, init) => {
+      const target = safeFetchTarget(input)
+      const method = init?.method ?? (typeof Request !== 'undefined' && input instanceof Request ? input.method : 'GET')
+      recordTtsTrace('fetch-start', { method, target })
+      try {
+        const response = await originalFetch.call(globalThis, input, init)
+        recordTtsTrace('fetch-response', {
+          method,
+          target,
+          status: response.status,
+          responseType: response.type,
+          finalTarget: safeFetchTarget(response.url || target),
+        })
+        return response
+      } catch (error) {
+        recordTtsTrace('fetch-failed', {
+          method,
+          target,
+          error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+        })
+        throw error
+      }
+    }
+    ttsFetchTraceState = { originalFetch, tracedFetch, users: 0 }
+    globalThis.fetch = tracedFetch
+  }
+
+  const traceState = ttsFetchTraceState
+  traceState.users += 1
+  let stopped = false
+  return () => {
+    if (stopped) return
+    stopped = true
+    traceState.users -= 1
+    if (traceState.users === 0) {
+      if (globalThis.fetch === traceState.tracedFetch) globalThis.fetch = traceState.originalFetch
+      ttsFetchTraceState = undefined
+    }
+  }
+}
 
 function ensureReadableStreamAsyncIterator() {
   const streamPrototype = globalThis.ReadableStream?.prototype
@@ -31,22 +95,48 @@ function ensureReadableStreamAsyncIterator() {
 }
 
 async function generateTtsAudio(text) {
-  ensureReadableStreamAsyncIterator()
-  const { KokoroTTS } = await import('kokoro-js')
-  if (!ttsModelPromise) {
-    const modelPromise = KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-v1.0-ONNX', {
-      dtype: 'q8',
-      device: 'wasm',
+  const stopFetchTrace = startTtsFetchTrace()
+  recordTtsTrace('generation-start', { transcriptLength: text.length })
+  try {
+    ensureReadableStreamAsyncIterator()
+    recordTtsTrace('module-import-start')
+    const { KokoroTTS } = await import('kokoro-js')
+    recordTtsTrace('module-import-ready')
+    if (!ttsModelPromise) {
+      recordTtsTrace('model-load-start', { model: 'onnx-community/Kokoro-82M-v1.0-ONNX', dtype: 'q8', device: 'wasm' })
+      const modelPromise = KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-v1.0-ONNX', {
+        dtype: 'q8',
+        device: 'wasm',
+        progress_callback: (progress) => recordTtsTrace(`model-${progress.status}`, {
+          file: progress.file,
+          progress: progress.progress,
+          loaded: progress.loaded,
+          total: progress.total,
+        }),
+      })
+      const retryableModelPromise = modelPromise.catch((error) => {
+        if (ttsModelPromise === retryableModelPromise) ttsModelPromise = undefined
+        throw error
+      })
+      ttsModelPromise = retryableModelPromise
+    } else {
+      recordTtsTrace('model-load-cached')
+    }
+    const synthesizer = await ttsModelPromise
+    recordTtsTrace('model-ready')
+    recordTtsTrace('synthesis-start')
+    const audio = await synthesizer.generate(text, { voice: 'af_bella' })
+    const blob = audio.toBlob()
+    recordTtsTrace('synthesis-ready', { audioBytes: blob.size, audioType: blob.type })
+    return blob
+  } catch (error) {
+    recordTtsTrace('generation-failed', {
+      error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
     })
-    const retryableModelPromise = modelPromise.catch((error) => {
-      if (ttsModelPromise === retryableModelPromise) ttsModelPromise = undefined
-      throw error
-    })
-    ttsModelPromise = retryableModelPromise
+    throw error
+  } finally {
+    stopFetchTrace()
   }
-  const synthesizer = await ttsModelPromise
-  const audio = await synthesizer.generate(text, { voice: 'af_bella' })
-  return audio.toBlob()
 }
 
 
@@ -767,6 +857,11 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
         } else {
           errorDetails = String(ttsError || 'Check your connection and try saving again.')
         }
+        const traceDetails = (window.__promptLibraryTtsTrace ?? []).slice(-24).map((entry) => {
+          const { time, event, ...details } = entry
+          return `${time} ${event}${Object.keys(details).length ? ` ${JSON.stringify(details)}` : ''}`
+        }).join('\n')
+        if (traceDetails) errorDetails += `\n\nRecent TTS trace:\n${traceDetails}`
         setGenerationError(`The default voice could not be generated:\n${errorDetails}`)
         setGeneratingAudio(false)
         return
