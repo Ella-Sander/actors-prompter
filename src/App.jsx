@@ -2265,7 +2265,7 @@ function App() {
             <span className="brand-mark" aria-hidden="true">P<span>/</span></span>
             <span className="brand-name">PROMPT<span>LIBRARY</span></span>
           </button>
-          {!selectedFolder && <span className="app-version">{`Ellaa v${APP_VERSION}`}</span>}
+          {!selectedFolder && <span className="app-version">{`Ella v${APP_VERSION}`}</span>}
         </div>
         <div className="topbar-tools">
           <div className="topbar-meta"><span className="status-dot" /> LOCAL ARCHIVE</div>
