@@ -82,85 +82,104 @@
 
 .app-shell.theme-light {
   color-scheme: light;
-  --tone-0d0d0d: #f0efea;
-  --tone-292929: #d3d1c9;
-  --tone-858585: #70716f;
-  --tone-080808: #e9e8e3;
-  --tone-ffffff05: #00000005;
-  --tone-242424: #dbdbdb;
-  --tone-080808ef: #e9e8e3ed;
-  --tone-fff: #000;
-  --tone-777: #70716f;
-  --tone-888: #686966;
-  --tone-a5a5a5: #5a5a5a;
-  --tone-e7e7e7: #181818;
-  --tone-ffffff55: #00000055;
-  --tone-282828: #d7d7d7;
-  --tone-f4f4f4: #0b0b0b;
-  --tone-8b8b8b: #747474;
-  --tone-f1f1f1: #0e0e0e;
-  --tone-aaa: #555;
-  --tone-191919: #e6e6e6;
-  --tone-333: #ccc;
-  --tone-666: #777874;
-  --tone-222: #ddd;
-  --tone-2c2c2c: #d1cfc7;
-  --tone-0a0a0ae8: #f0efeaeb;
-  --tone-626262: #9d9d9d;
-  --tone-0f0f0f: #e3e2dd;
-  --tone-707070: #8f8f8f;
-  --tone-d7d7d7: #282828;
-  --tone-ededed: #121212;
-  --tone-929292: #6d6d6d;
-  --tone-d6d6d6: #292929;
-  --tone-d0d0d0: #2f2f2f;
-  --tone-a0a0a0: #5f5f5f;
-  --tone-dedede: #212121;
-  --tone-454545: #bababa;
-  --tone-ddd: #222;
-  --tone-111: #eee;
-  --tone-bbb: #444;
-  --tone-353535: #cacaca;
-  --tone-c9c9c9: #363636;
-  --tone-0b0b0b: #f4f4f4;
-  --tone-555: #aaa;
-  --tone-151515: #eaeaea;
-  --tone-eee: #111;
-  --tone-2d2d2d: #d2d2d2;
-  --tone-2b2b2b: #d4d4d4;
-  --tone-090909: #f6f6f6;
-  --tone-1e1e1e: #e1e1e1;
-  --tone-050505: #fafafa;
-  --tone-f5f5f5: #0a0a0a;
-  --tone-b8b8b8: #474747;
-  --tone-1b1b1b: #e4e4e4;
-  --tone-171717: #e8e8e8;
-  --tone-303030: #cfcfcf;
-  --tone-0a0a0a: #f5f5f5;
-  --tone-414141: #bebebe;
-  --tone-262626: #d9d9d9;
-  --tone-bcbcbc: #434343;
-  --tone-8e8e8e: #717171;
-  --tone-f0f0f0: #0f0f0f;
-  --tone-ff6a00: #e96519;
-  --tone-686868: #777874;
-  --tone-d8a94b: #2756b4;
-  --tone-ccc: #333;
-  --tone-e9e9e9: #161616;
-  --tone-383838: #c7c7c7;
-  --tone-717171: #747570;
-  --tone-3c3c3c: #c9c7bf;
-  --tone-bdbdbd: #424242;
-  --tone-000000c9: #ffffffc9;
-  --tone-0c0c0c: #eeede8;
+  --tone-0d0d0d: #f8fbff;
+  --tone-292929: #c8d7e6;
+  --tone-858585: #536c85;
+  --tone-080808: #eaf2f9;
+  --tone-ffffff05: #153b5c0b;
+  --tone-242424: #d1deea;
+  --tone-080808ef: #eaf2f9ed;
+  --tone-fff: #10283f;
+  --tone-777: #5b7188;
+  --tone-888: #526981;
+  --tone-a5a5a5: #496179;
+  --tone-e7e7e7: #1c344c;
+  --tone-ffffff55: #10283f38;
+  --tone-282828: #cad9e7;
+  --tone-f4f4f4: #172f47;
+  --tone-8b8b8b: #5d748b;
+  --tone-f1f1f1: #10283f;
+  --tone-aaa: #4e657d;
+  --tone-191919: #e2edf6;
+  --tone-333: #c2d2e1;
+  --tone-666: #61778e;
+  --tone-222: #d3e0eb;
+  --tone-2c2c2c: #d5e1ec;
+  --tone-0a0a0ae8: #eef4faed;
+  --tone-626262: #607991;
+  --tone-0f0f0f: #e1ebf5;
+  --tone-707070: #5d748b;
+  --tone-d7d7d7: #203a53;
+  --tone-ededed: #142c44;
+  --tone-929292: #5a7189;
+  --tone-d6d6d6: #243d56;
+  --tone-d0d0d0: #29445e;
+  --tone-a0a0a0: #536b83;
+  --tone-dedede: #203a53;
+  --tone-454545: #b7cada;
+  --tone-ddd: #233b54;
+  --tone-111: #f2f7fc;
+  --tone-bbb: #526981;
+  --tone-353535: #c8d8e7;
+  --tone-c9c9c9: #304b66;
+  --tone-0b0b0b: #f6faff;
+  --tone-555: #6b8197;
+  --tone-151515: #e9f1f8;
+  --tone-eee: #132b43;
+  --tone-2d2d2d: #cbd9e7;
+  --tone-2b2b2b: #c8d8e7;
+  --tone-090909: #f7fbff;
+  --tone-1e1e1e: #dce8f2;
+  --tone-050505: #fbfdff;
+  --tone-f5f5f5: #142d45;
+  --tone-b8b8b8: #4e6680;
+  --tone-1b1b1b: #e3edf6;
+  --tone-171717: #e7f0f8;
+  --tone-303030: #c5d6e5;
+  --tone-0a0a0a: #f1f7fc;
+  --tone-414141: #b1c5d8;
+  --tone-262626: #d6e2ed;
+  --tone-bcbcbc: #385570;
+  --tone-8e8e8e: #60778f;
+  --tone-f0f0f0: #10283f;
+  --tone-ff6a00: #c84f08;
+  --tone-686868: #58718b;
+  --tone-d8a94b: #245bc4;
+  --tone-ccc: #314a63;
+  --tone-e9e9e9: #1b344d;
+  --tone-383838: #bdcede;
+  --tone-717171: #536b84;
+  --tone-3c3c3c: #d2dfeb;
+  --tone-bdbdbd: #3b5874;
+  --tone-000000c9: #10283fc9;
+  --tone-0c0c0c: #eef5fb;
   --tone-000: #fff;
-  --tone-f2f2f2: #0d0d0d;
-  --tone-343434: #cbcbcb;
-  --tone-c6c6c6: #393939;
-  --tone-323232: #cdcdcd;
-  --tone-a7a7a7: #585858;
-  --tone-e2e2e2: #1d1d1d;
+  --tone-f2f2f2: #142d45;
+  --tone-343434: #cbd9e6;
+  --tone-c6c6c6: #34516c;
+  --tone-323232: #c5d6e5;
+  --tone-a7a7a7: #506982;
+  --tone-e2e2e2: #203b56;
+  --accent-orange: #c84f08;
 }
+
+.app-shell.theme-light .missing-recording-status,
+.app-shell.theme-light .prompt-audio-missing { color: #855500; }
+.app-shell.theme-light .recording-ready-status { color: #216844; }
+.app-shell.theme-light .recording-generation-stages li.is-complete,
+.app-shell.theme-light .recording-generation-stages li.is-complete .recording-generation-stage-marker { color: #216844; border-color: #4f9b70; }
+.app-shell.theme-light .recording-generation-stages li.is-current .recording-generation-stage-marker { color: #245bc4; border-color: #245bc4; box-shadow: 0 0 0 3px rgb(36 91 196 / 13%); }
+.app-shell.theme-light .folder-workspace .prompt-row-no-audio { border-color: #c9b47e; box-shadow: inset 2px 0 0 #aa790f, inset 0 1px 0 rgb(255 255 255 / 72%); }
+.app-shell.theme-light .folder-workspace .prompt-row-no-audio { background: linear-gradient(110deg, #f8fbff, #f3f7fb), radial-gradient(ellipse at 0% 50%, rgb(170 121 15 / 7%), transparent 58%); }
+.app-shell.theme-light .prompt-audio-missing { border-color: #b99a51; background: #f5f2e8; color: #76500a; }
+.app-shell.theme-light .prompt-audio-missing > span { border-color: #c4a85f; color: #80590b; }
+.app-shell.theme-light .prompt-actions .prompt-delete-action:hover { border-color: #bd665a; background: #fbefed; color: #8e352c; }
+.app-shell.theme-light .prompt-actions .prompt-delete-action .prompt-action-icon { color: #9e5148; }
+.app-shell.theme-light .prompt-actions .prompt-edit-action .prompt-action-icon { color: #b84a08; }
+.app-shell.theme-light .missing-prompt-edit { border-color: #a84b3e; color: #8c352d; }
+.app-shell.theme-light .missing-prompt-edit:hover { color: #69251f; border-color: #8c352d; }
+.app-shell.theme-light .remove-recording-button { color: #9a443a; }
+.app-shell.theme-light .form-error { color: #9b3b31; }
 
 .app-shell {
   --surface: var(--tone-0d0d0d);
