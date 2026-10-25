@@ -60,7 +60,15 @@
     const location = event.filename
       ? `${event.filename}${event.lineno ? `:${event.lineno}` : ''}${event.colno ? `:${event.colno}` : ''}`
       : ''
-    showError(event.message || 'Uncaught JavaScript error.', [location, describeError(event.error)].filter(Boolean).join('\n'))
+    const isOpaqueScriptError = event.message === 'Script error.' && !event.filename && !event.error
+    const details = isOpaqueScriptError
+      ? [
+          'The browser did not expose the script filename, line, or exception object, so this message cannot identify the failing code.',
+          `Page: ${window.location.origin}`,
+          'Check the recent TTS trace below if this happened during voice generation. A missing trace means the error occurred before TTS started.',
+        ].join('\n')
+      : [location, describeError(event.error)].filter(Boolean).join('\n')
+    showError(event.message || 'Uncaught JavaScript error.', details)
   }, true)
 
   window.addEventListener('unhandledrejection', (event) => {
