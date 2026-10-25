@@ -26,7 +26,12 @@
   }
 
   function describeError(error) {
-    if (error instanceof Error) return error.stack || `${error.name}: ${error.message}`
+    if (error instanceof Error) {
+      const summary = `${error.name || 'Error'}: ${error.message || 'No error message provided.'}`
+      return error.stack && !error.stack.includes(error.message)
+        ? `${summary}\n${error.stack}`
+        : error.stack || summary
+    }
     if (typeof error === 'string') return error
     try {
       return JSON.stringify(error, null, 2) || String(error)
