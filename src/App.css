@@ -1010,6 +1010,7 @@
 .run-controls {
   max-width: 100%;
   overflow-x: auto;
+  padding-block: 4px;
 }
 
 .run-prompter-content {
@@ -1389,6 +1390,10 @@
   font-family: 'Courier New', monospace;
   font-size: 10px;
 }
+
+.run-error p { margin: 0 0 8px; }
+.missing-prompt-edit { margin: 0 8px 6px 0; padding: 5px 8px; border: 1px solid #8e3e32; color: #ff8d7e; background: transparent; font: inherit; font-size: 10px; cursor: pointer; }
+.missing-prompt-edit:hover { color: #fff; border-color: #ff8d7e; }
 
 .rehearsal-panel {
   height: 300px;
@@ -1895,7 +1900,7 @@ body.is-reordering-prompts * {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 14px;
+  gap: 8px;
 }
 
 .prompt-info h3 {
@@ -2008,7 +2013,7 @@ body.is-reordering-prompts * {
   justify-content: space-between;
   gap: 12px;
   width: fit-content;
-  margin: 5px 0 0 auto;
+  margin: 0;
   padding: 4px 9px;
   border: 1px solid color-mix(in srgb, var(--tone-fff) 8%, transparent);
   border-radius: 999px;
@@ -2042,6 +2047,24 @@ body.is-reordering-prompts * {
   font-variant-numeric: tabular-nums;
   font-weight: 500;
   letter-spacing: 0.03em;
+}
+
+.audio-player-group.is-trimmed {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 3px;
+}
+
+.audio-player-group.is-trimmed .audio-player {
+  min-width: 0;
+  width: 100%;
+  margin: 0;
+}
+
+.audio-player-group.is-trimmed .audio-player-trimmed-duration {
+  align-self: flex-end;
+  margin: 0 0 1px;
 }
 
 .transcript-editor {
@@ -2243,6 +2266,29 @@ body.is-reordering-prompts * {
   color: var(--tone-a7a7a7);
   font-size: 11px;
 }
+
+.missing-recording-status { color: #d7b779; font-weight: 600; }
+.recording-ready-status { color: #9bcf9e; font-weight: 600; }
+.prompt-missing-recording { display: inline-block; margin-top: 7px; font-size: 10px; }
+.prompt-audio-missing { display: block; min-width: 130px; color: #d7b779; font-size: 10px; }
+.recording-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+.recording-actions .generate-recording-button,
+.recording-actions .attach-recording-button { min-height: 36px; padding: 0 11px; font-size: 10px; }
+.attach-recording-button { position: relative; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--tone-555); color: var(--tone-c6c6c6); cursor: pointer; }
+.attach-recording-button:hover { color: var(--tone-fff); border-color: var(--tone-aaa, #aaa); }
+.attach-recording-button input { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; }
+.remove-recording-button { min-height: 36px; padding: 0 7px; color: #ff8d7e; font-size: 10px; }
+.generate-recording-button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; }
+.generate-recording-button:disabled { opacity: .5; cursor: not-allowed; }
+.recording-generation-progress { display: grid; gap: 12px; margin-top: 12px; }
+.recording-generation-progress-copy { display: flex; align-items: center; gap: 8px; color: var(--tone-a7a7a7); font-size: 11px; }
+.recording-generation-stages { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin: 0; padding: 0; list-style: none; }
+.recording-generation-stages li { display: grid; justify-items: center; gap: 5px; min-width: 0; color: var(--tone-777); font-size: 9px; text-align: center; }
+.recording-generation-stage-marker { display: grid; place-items: center; width: 20px; height: 20px; border: 1px solid var(--tone-555); border-radius: 50%; color: var(--tone-a7a7a7); font-size: 9px; }
+.recording-generation-stages li.is-current { color: var(--tone-eee); }
+.recording-generation-stages li.is-current .recording-generation-stage-marker { border-color: #d7b779; color: #d7b779; box-shadow: 0 0 0 3px rgb(215 183 121 / 12%); }
+.recording-generation-stages li.is-complete { color: #9bcf9e; }
+.recording-generation-stages li.is-complete .recording-generation-stage-marker { border-color: #9bcf9e; color: #9bcf9e; }
 
 .record-indicator {
   width: 7px;
@@ -2816,6 +2862,115 @@ body.is-reordering-prompts * {
   letter-spacing: 0.045em;
 }
 
+.folder-workspace .prompt-row-no-audio {
+  border-color: color-mix(in srgb, #d7b779 28%, var(--tone-303030));
+  box-shadow: inset 2px 0 0 color-mix(in srgb, #d7b779 52%, transparent), inset 0 1px 0 color-mix(in srgb, var(--tone-fff) 3%, transparent);
+  background:
+    linear-gradient(110deg, color-mix(in srgb, var(--tone-111) 96%, transparent), color-mix(in srgb, var(--tone-090909) 88%, transparent)),
+    radial-gradient(ellipse at 0% 50%, color-mix(in srgb, #d7b779 8%, transparent), transparent 58%);
+}
+
+.prompt-actions .prompt-edit-action,
+.prompt-actions .prompt-delete-action {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 11px;
+  border: 1px solid var(--tone-383838);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--tone-fff) 3%, transparent);
+  color: var(--tone-c6c6c6);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.035em;
+  cursor: pointer;
+  transition: transform 150ms ease, color 150ms ease, border-color 150ms ease, background 150ms ease;
+}
+
+.prompt-action-icon {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.5;
+}
+
+.prompt-edit-action .prompt-action-icon {
+  color: var(--tone-ff9a52);
+}
+
+.prompt-delete-action .prompt-action-icon {
+  color: #bd847a;
+}
+
+.prompt-actions .prompt-edit-action:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--tone-ff6a00) 55%, var(--tone-383838));
+  background: color-mix(in srgb, var(--tone-ff6a00) 9%, var(--tone-111));
+  color: var(--tone-fff);
+}
+
+.prompt-actions .prompt-delete-action:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, #df8072 56%, var(--tone-383838));
+  background: color-mix(in srgb, #df8072 9%, var(--tone-111));
+  color: #f2c4bb;
+}
+
+.prompt-audio-missing {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-self: stretch;
+  gap: 9px;
+  padding: 0 12px;
+  border: 1px dashed color-mix(in srgb, #d7b779 38%, var(--tone-383838));
+  border-radius: 10px;
+  background: color-mix(in srgb, #d7b779 5%, var(--tone-090909));
+  color: #cbb98f;
+  font-size: 10px;
+  letter-spacing: 0.045em;
+}
+
+.prompt-audio-missing > span {
+  display: grid;
+  width: 23px;
+  height: 23px;
+  flex: 0 0 23px;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, #d7b779 28%, var(--tone-383838));
+  border-radius: 7px;
+  color: #d7b779;
+  font-size: 13px;
+}
+
+@media (max-width: 760px) {
+  .prompt-row .prompt-audio-missing {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+}
+
+@media (max-width: 420px) {
+  .prompt-row .prompt-actions .prompt-edit-action,
+  .prompt-row .prompt-actions .prompt-delete-action {
+    min-height: 36px;
+    padding-inline: 8px;
+  }
+
+  .audio-player-trimmed-duration {
+    gap: 6px;
+    padding-inline: 6px;
+    font-size: 8px;
+  }
+}
+
 @media (max-width: 520px) {
   .run-controls {
     gap: 5px;
@@ -3049,6 +3204,18 @@ body.is-reordering-prompts * {
   margin: 8px 0 14px;
 }
 
+.script-import-progress,
+.script-validation-reason {
+  margin: 4px 0 0;
+  color: var(--accent-orange, #ff9d42);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.script-preview-line.is-invalid {
+  border-color: color-mix(in srgb, var(--accent-orange, #ff9d42) 48%, var(--tone-303030));
+}
+
 .script-preview-list {
   display: grid;
   gap: 10px;
@@ -3100,6 +3267,7 @@ body.is-reordering-prompts * {
     font-size: 10px;
   }
 }
+
 
 .script-line-delete {
   flex: 0 0 auto;

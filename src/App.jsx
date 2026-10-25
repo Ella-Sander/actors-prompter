@@ -4,13 +4,47 @@ import ortWasmBinaryUrl from '../node_modules/kokoro-js/node_modules/onnxruntime
 import './App.css'
 
 const DATABASE_NAME = 'prompt-library'
-const DATABASE_VERSION = 1
+const DATABASE_VERSION = 2
 const APP_VERSION = '1.0.0'
 
 let databasePromise
 const audioBoundsCache = new WeakMap()
 let ttsModelPromise
 let ttsFetchTraceState
+let ttsGenerationQueue = Promise.resolve()
+
+const NON_ENGLISH_CLUES = {
+  Spanish: new Set(['el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 'que', 'qué', 'como', 'cómo', 'pero', 'porque', 'para', 'por', 'con', 'estoy', 'estas', 'estás', 'está', 'somos', 'tengo', 'tiene', 'quiero', 'puedo', 'hola', 'gracias', 'adios', 'adiós']),
+  French: new Set(['le', 'la', 'les', 'un', 'une', 'des', 'que', 'qui', 'quoi', 'mais', 'avec', 'pour', 'dans', 'est', 'suis', 'êtes', 'vous', 'nous', 'je', 'tu', 'pas', 'bonjour', 'merci', 'oui', 'non']),
+  German: new Set(['der', 'die', 'das', 'ein', 'eine', 'und', 'aber', 'mit', 'für', 'nicht', 'ich', 'du', 'wir', 'sie', 'ist', 'sind', 'bin', 'habe', 'haben', 'was', 'wie', 'danke', 'hallo']),
+  Italian: new Set(['il', 'lo', 'la', 'gli', 'le', 'un', 'una', 'che', 'chi', 'con', 'per', 'non', 'sono', 'siamo', 'voglio', 'questo', 'questa', 'ciao', 'grazie']),
+  Portuguese: new Set(['o', 'a', 'os', 'as', 'um', 'uma', 'que', 'com', 'para', 'não', 'nao', 'estou', 'você', 'voce', 'vocês', 'ola', 'olá', 'obrigado', 'obrigada']),
+}
+
+function validateScriptDialogue(value) {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+  if (!text) return { valid: false, reason: 'Empty dialogue' }
+  if (!/[\p{L}\p{N}]/u.test(text)) return { valid: false, reason: 'Punctuation or symbols only' }
+  if (/^\d+$/.test(text)) return { valid: false, reason: 'Looks like a page number or isolated number' }
+  if (/[\p{Script=Cyrillic}\p{Script=Hebrew}\p{Script=Arabic}\p{Script=Devanagari}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}\p{Script=Hangul}]/u.test(text)) return { valid: false, reason: 'Language is not supported for default voice generation' }
+  const words = text.toLocaleLowerCase().match(/[\p{L}]+/gu) ?? []
+  const uniqueClues = new Set()
+  for (const word of words) {
+    for (const [language, clues] of Object.entries(NON_ENGLISH_CLUES)) {
+      if (clues.has(word)) uniqueClues.add(language)
+    }
+  }
+  const distinctNonEnglishWords = Object.values(NON_ENGLISH_CLUES).reduce((count, clues) => count + new Set(words.filter((word) => clues.has(word))).size, 0)
+  const hasSpanishQuestionPunctuation = /[¿¡]/u.test(text) && uniqueClues.has('Spanish')
+  if ((uniqueClues.size === 1 && distinctNonEnglishWords >= 2 && words.length >= 3) || hasSpanishQuestionPunctuation) {
+    return { valid: false, reason: `Looks like unsupported ${[...uniqueClues][0] ?? 'non-English'} dialogue` }
+  }
+  return { valid: true, text }
+}
+
+function isUsableRecording(audio) {
+  return Boolean(audio && typeof audio.size === 'number' && audio.size > 0 && typeof audio.arrayBuffer === 'function')
+}
 
 function recordRehearsalTrace(session, event, details = {}) {
   if (typeof window === 'undefined') return
@@ -167,15 +201,29 @@ function ensureReadableStreamAsyncIterator() {
   })
 }
 
-async function generateTtsAudio(text) {
+function generateTtsAudio(text, onProgress) {
+  const generation = ttsGenerationQueue.then(() => generateTtsAudioNow(text, onProgress))
+  ttsGenerationQueue = generation.then(() => undefined, () => undefined)
+  return generation
+}
+
+async function generateTtsAudioNow(text, onProgress) {
   const stopFetchTrace = startTtsFetchTrace()
   recordTtsTrace('generation-start', { transcriptLength: text.length })
+  onProgress?.({ phase: 'starting', progress: 0 })
   try {
     ensureReadableStreamAsyncIterator()
     recordTtsTrace('module-import-start')
-    const { KokoroTTS, env: kokoroEnv } = await import('kokoro-js')
+    const [{ KokoroTTS, env: kokoroEnv }, { env: transformersEnv }] = await Promise.all([
+      import('kokoro-js'),
+      import('../node_modules/kokoro-js/node_modules/@huggingface/transformers/dist/transformers.web.js'),
+    ])
     recordTtsTrace('module-import-ready')
     kokoroEnv.wasmPaths = { mjs: ortWasmModuleUrl, wasm: ortWasmBinaryUrl }
+    // ONNX Runtime's proxy mode runs inference in a worker so synthesis does
+    // not monopolize the page's main thread (and trigger browser hang warnings).
+    transformersEnv.backends.onnx.wasm.proxy = true
+    recordTtsTrace('runtime-worker-proxy-enabled')
     recordTtsTrace('runtime-assets-configured', { module: ortWasmModuleUrl, wasm: ortWasmBinaryUrl })
     const runtimeCapabilities = getWasmRuntimeCapabilities()
     recordTtsTrace('runtime-capabilities', runtimeCapabilities)
@@ -198,12 +246,14 @@ async function generateTtsAudio(text) {
       const modelPromise = KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-v1.0-ONNX', {
         dtype: 'q8',
         device: 'wasm',
-        progress_callback: (progress) => recordTtsTrace(`model-${progress.status}`, {
-          file: progress.file,
-          progress: progress.progress,
-          loaded: progress.loaded,
-          total: progress.total,
-        }),
+        progress_callback: (progress) => {
+          recordTtsTrace(`model-${progress.status}`, {
+            file: progress.file,
+            progress: progress.progress,
+            loaded: progress.loaded,
+            total: progress.total,
+          })
+        },
       })
       const retryableModelPromise = modelPromise.catch((error) => {
         recordTtsTrace('model-load-failed', {
@@ -217,12 +267,15 @@ async function generateTtsAudio(text) {
     } else {
       recordTtsTrace('model-load-cached')
     }
+    onProgress?.({ phase: 'loading' })
     const synthesizer = await ttsModelPromise
     recordTtsTrace('model-ready')
     recordTtsTrace('synthesis-start')
+    onProgress?.({ phase: 'synthesizing' })
     const audio = await synthesizer.generate(text, { voice: 'af_bella' })
     const blob = audio.toBlob()
     recordTtsTrace('synthesis-ready', { audioBytes: blob.size, audioType: blob.type })
+    onProgress?.({ phase: 'generated' })
     return blob
   } catch (error) {
     recordTtsTrace('generation-failed', {
@@ -250,13 +303,14 @@ function isCharacterCue(line) {
   return letters >= 2 && letters / Math.max(1, text.match(/[A-Z]/gi)?.length ?? 0) > 0.85
 }
 
-async function extractScriptLines(file) {
+async function extractScriptLines(file, onPageProgress = () => {}) {
   const [pdfjsLib, pdfWorker] = await Promise.all([
     import('pdfjs-dist'),
     import('pdfjs-dist/build/pdf.worker.min.mjs?url'),
   ])
   pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker.default
   const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise
+  onPageProgress({ page: 0, total: pdf.numPages })
   const lines = []
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
     const page = await pdf.getPage(pageNumber)
@@ -273,13 +327,17 @@ async function extractScriptLines(file) {
       .sort(([yA], [yB]) => yB - yA)
       .map(([, items]) => items.sort((a, b) => a.x - b.x).map((item) => item.text).join(' ').replace(/\s+/g, ' ').trim())
     lines.push(...pageLines)
+    onPageProgress({ page: pageNumber, total: pdf.numPages })
   }
 
   const dialogue = []
   let activeCharacter = ''
   let activeText = []
   const flush = () => {
-    const text = activeText.join(' ').replace(/\s+/g, ' ').trim()
+    const text = activeText.join(' ')
+      .replace(/\s*[([](?:laughs?|chuckles?|sighs?|gasps?|coughs?|sobs?|cries?|whispers?|shouts?|offscreen|beat|pause|a beat|long pause)[)\]]\s*/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
     if (activeCharacter && text) dialogue.push({ id: makeId(), character: activeCharacter, text })
     activeText = []
   }
@@ -295,7 +353,7 @@ async function extractScriptLines(file) {
   }
   flush()
   if (!dialogue.length) throw new Error('No dialogue was detected. This PDF may be scanned, image-only, or not formatted as a character script.')
-  return dialogue
+  return { dialogue, pageCount: pdf.numPages }
 }
 function getAudioBounds(blob) {
   if (!blob || typeof blob.arrayBuffer !== 'function') return Promise.resolve({ start: 0, end: 0 })
@@ -399,8 +457,9 @@ function openDatabase() {
       const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION)
       request.onupgradeneeded = () => {
         const database = request.result
-        database.createObjectStore('folders', { keyPath: 'id' })
-        database.createObjectStore('prompts', { keyPath: 'id' })
+        if (!database.objectStoreNames.contains('folders')) database.createObjectStore('folders', { keyPath: 'id' })
+        if (!database.objectStoreNames.contains('prompts')) database.createObjectStore('prompts', { keyPath: 'id' })
+        if (!database.objectStoreNames.contains('importJobs')) database.createObjectStore('importJobs', { keyPath: 'id' })
       }
       request.onsuccess = () => resolve(request.result)
       request.onerror = () => reject(request.error)
@@ -412,6 +471,14 @@ function openDatabase() {
 function readAll(storeName) {
   return openDatabase().then((database) => new Promise((resolve, reject) => {
     const request = database.transaction(storeName).objectStore(storeName).getAll()
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error)
+  }))
+}
+
+function readRecord(storeName, id) {
+  return openDatabase().then((database) => new Promise((resolve, reject) => {
+    const request = database.transaction(storeName).objectStore(storeName).get(id)
     request.onsuccess = () => resolve(request.result)
     request.onerror = () => reject(request.error)
   }))
@@ -717,14 +784,14 @@ function AudioPlayer({ audio, trimSilence = false }) {
   }, [audio, source, trimSilence])
 
   return source ? (
-    <div className="audio-player-group">
-      <audio ref={playerRef} className="audio-player" controls preload="metadata" src={source}>Audio playback is not supported.</audio>
+    <div className={`audio-player-group${trimSilence ? ' is-trimmed' : ''}`}>
       {trimSilence && Number.isFinite(playbackDuration) && (
         <div className="audio-player-trimmed-duration" aria-label={`Trimmed playback duration ${formatRoundedTime(playbackDuration)}`}>
           <span className="trimmed-duration-label"><i aria-hidden="true" />TRIMMED</span>
           <strong>{formatRoundedTime(playbackDuration)}</strong>
         </div>
       )}
+      <audio ref={playerRef} className="audio-player" controls preload="metadata" src={source}>Audio playback is not supported.</audio>
     </div>
   ) : null
 }
@@ -737,6 +804,7 @@ function ScriptImportDialog({ folderName, onClose, onImport }) {
   const [selectedCharacter, setSelectedCharacter] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+  const [pageProgress, setPageProgress] = useState(null)
 
   async function selectFile(event) {
     const file = event.target.files?.[0]
@@ -745,15 +813,16 @@ function ScriptImportDialog({ folderName, onClose, onImport }) {
     setLines([])
     setCharacters([])
     setError('')
+    setPageProgress(null)
     if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
       setError('Choose a PDF file to import.')
       return
     }
     setLoading(true)
     try {
-      const extracted = await extractScriptLines(file)
-      const detected = [...new Set(extracted.map((line) => line.character))]
-      setLines(extracted)
+      const extracted = await extractScriptLines(file, setPageProgress)
+      const detected = [...new Set(extracted.dialogue.map((line) => line.character))]
+      setLines(extracted.dialogue)
       setCharacters(detected)
       setSelectedCharacter(detected[0] ?? '')
     } catch (extractError) {
@@ -772,15 +841,17 @@ function ScriptImportDialog({ folderName, onClose, onImport }) {
   }
 
   async function confirmImport() {
-    const importableLines = lines.filter((line) => line.text.trim())
+    const checkedLines = lines.map((line) => ({ ...line, validation: validateScriptDialogue(line.text) }))
+    const importableLines = checkedLines.filter((line) => line.validation.valid).map(({ validation, ...line }) => ({ ...line, text: validation.text }))
+    const skippedLines = checkedLines.filter((line) => !line.validation.valid).map((line) => ({ character: line.character, reason: line.validation.reason }))
     if (!selectedCharacter || !importableLines.length) {
-      setError('Choose your character and keep at least one dialogue line to import.')
+      setError('No valid dialogue remains. Keep at least one supported, non-empty spoken line to import.')
       return
     }
     setLoading(true)
     setError('')
     try {
-      await onImport(importableLines, selectedCharacter, characters)
+      await onImport(importableLines, selectedCharacter, characters, { skippedLines, pageCount: pageProgress?.total ?? 0, fileName })
     } catch (importError) {
       setError(importError?.message || 'The prompts could not be imported. Please try again.')
     } finally {
@@ -801,6 +872,7 @@ function ScriptImportDialog({ folderName, onClose, onImport }) {
         <label className="field-label" htmlFor="script-pdf">PDF file</label>
         <input id="script-pdf" className="text-field script-file-input" type="file" accept="application/pdf,.pdf" onChange={selectFile} disabled={loading} />
         {fileName && <p className="script-import-meta">{fileName}{loading ? '  /  PROCESSING' : lines.length ? `  /  ${lines.length} DIALOGUE LINES` : ''}</p>}
+        {loading && pageProgress && <p className="script-import-progress" role="status">Reading PDF pages: {pageProgress.page} of {pageProgress.total}</p>}
         {characters.length > 0 && <>
           <label className="field-label" htmlFor="script-character">Character you will play</label>
           <select id="script-character" className="text-field character-select" value={selectedCharacter} onChange={(event) => setSelectedCharacter(event.target.value)} disabled={loading}>
@@ -809,9 +881,10 @@ function ScriptImportDialog({ folderName, onClose, onImport }) {
           <p className="script-import-hint">Your selected character becomes Myself. Other characters become Reader.</p>
           <div className="script-preview-list" aria-label="Review extracted dialogue">
             {lines.map((line, index) => (
-              <div className="script-preview-line" key={line.id}>
+              <div className={`script-preview-line${validateScriptDialogue(line.text).valid ? '' : ' is-invalid'}`} key={line.id}>
                 <div className="script-preview-label"><strong>{line.character}</strong><span>{line.character === selectedCharacter ? 'MYSELF' : 'READER'}  /  {String(index + 1).padStart(2, '0')}</span><button className="script-line-delete" type="button" onClick={() => removeLine(line.id)} disabled={loading} aria-label={`Remove ${line.character} dialogue ${index + 1}`}>Remove</button></div>
                 <textarea className="text-field script-preview-text" value={line.text} onChange={(event) => editLine(line.id, event.target.value)} disabled={loading} aria-label={`${line.character} dialogue ${index + 1}`} />
+                {!validateScriptDialogue(line.text).valid && <p className="script-validation-reason">Skipped during import: {validateScriptDialogue(line.text).reason}</p>}
               </div>
             ))}
           </div>
@@ -820,13 +893,14 @@ function ScriptImportDialog({ folderName, onClose, onImport }) {
         {error && <p className="form-error" role="alert">{error}</p>}
         <div className="dialog-actions">
           <button className="quiet-button" type="button" onClick={onClose} disabled={loading}>Cancel</button>
-          {lines.length > 0 && <button className="primary-button" type="button" onClick={confirmImport} disabled={loading}>{loading ? 'Preparing...' : 'Approve & import'}</button>}
+          {lines.length > 0 && <button className="primary-button" type="button" onClick={confirmImport} disabled={loading}>{loading ? 'Saving prompts…' : 'Done — import prompts'}</button>}
         </div>
       </section>
     </div>
   )
 }
-function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
+
+function PromptDialog({ folderName, characters, prompt, onClose, onSave, onGenerateRecording }) {
   const [speaker, setSpeaker] = useState(prompt?.speaker ?? 'Myself')
   const [character, setCharacter] = useState(prompt?.character ?? '')
   const [audio, setAudio] = useState(prompt?.audio ?? null)
@@ -841,11 +915,18 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
   const [error, setError] = useState('')
   const [generationError, setGenerationError] = useState('')
   const [generatingAudio, setGeneratingAudio] = useState(false)
+  const [generationProgress, setGenerationProgress] = useState(null)
   const recorderRef = useRef(null)
   const recognitionRef = useRef(null)
   const chunksRef = useRef([])
   const recordingFailedRef = useRef(false)
   const recordingStartingRef = useRef(false)
+  const liveTranscriptionAllowedRef = useRef(false)
+  const promptIdRef = useRef(prompt?.id ?? makeId())
+  const promptCreatedAtRef = useRef(prompt?.createdAt ?? Date.now())
+  const usableAudio = isUsableRecording(audio)
+  const generationPhase = generationProgress?.phase ?? 'preparing'
+    const generationStage = { preparing: 0, loading: 1, synthesizing: 2, complete: 3 }[generationPhase] ?? 0
 
   useEffect(() => {
     if (!recording) return undefined
@@ -862,9 +943,11 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
 
   async function startRecording() {
     if (recordingStartingRef.current || recorderRef.current?.state === 'recording') return
+    liveTranscriptionAllowedRef.current = !transcript.trim()
     recordingStartingRef.current = true
     setRecordingStarting(true)
     setError('')
+    setGenerationError('')
     setTranscriptNotice('')
     setTranscriptError('')
     setSeconds(0)
@@ -902,6 +985,7 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
         if (event.data.size > 0) chunksRef.current.push(event.data)
       }
       recorder.onstop = () => {
+        liveTranscriptionAllowedRef.current = false
         const clip = new Blob(chunksRef.current, { type: recorder.mimeType || supportedMimeType || 'audio/webm' })
         recordPromptRecordingTrace('recorder-stopped', { bytes: clip.size, failed: recordingFailedRef.current })
         if (clip.size > 0 && !recordingFailedRef.current) {
@@ -915,6 +999,7 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
         setRecording(false)
       }
       recorder.onerror = () => {
+        liveTranscriptionAllowedRef.current = false
         recordingFailedRef.current = true
         recordPromptRecordingTrace('recorder-error', { state: recorder.state, mimeType: recorder.mimeType || 'unknown' })
         setError('The recording stopped unexpectedly. Your previous audio is still available; please try again.')
@@ -935,6 +1020,7 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
           recognition.interimResults = true
           recognition.lang = 'en-US'
           recognition.onresult = (event) => {
+            if (!liveTranscriptionAllowedRef.current) return
             const spokenWords = Array.from(event.results)
               .map((result) => result[0].transcript)
               .join(' ')
@@ -973,6 +1059,7 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
   }
 
   function stopRecording() {
+    liveTranscriptionAllowedRef.current = false
     const recognition = recognitionRef.current
     recognitionRef.current = null
     try {
@@ -985,70 +1072,80 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
     if (recorder?.state === 'recording') recorder.stop()
   }
 
+  function getPromptPayload() {
+    const cleanTranscript = transcript.trim()
+    return {
+      ...(prompt ?? {}),
+      id: promptIdRef.current,
+      speaker,
+      character,
+      audio: isUsableRecording(audio) ? audio : null,
+      audioSource: isUsableRecording(audio) ? audioSource : 'none',
+      generatedForTranscript: isUsableRecording(audio) && audioSource === 'tts' ? cleanTranscript : null,
+      trimSilence,
+      transcript: cleanTranscript,
+      createdAt: promptCreatedAtRef.current,
+    }
+  }
+
   async function submitPrompt(event) {
     event.preventDefault()
-    if (recording || generatingAudio) return
+    if (recording || recordingStarting || generatingAudio) return
     if (!transcript.trim()) {
       setTranscriptError('Add an English transcript before saving this recording.')
       return
     }
-    const cleanTranscript = transcript.trim()
-    let savedAudio = audio
-    let savedAudioSource = audioSource
-    const isUserRecording = Boolean(audio && audioSource !== 'tts')
-    const transcriptChanged = cleanTranscript !== (prompt?.transcript ?? '')
-    if (!isUserRecording && (!audio || audioSource !== 'tts' || transcriptChanged)) {
-      setGeneratingAudio(true)
-      setGenerationError('')
-      try {
-        savedAudio = await generateTtsAudio(cleanTranscript)
-        savedAudioSource = 'tts'
-      } catch (ttsError) {
-        let errorDetails
-        if (ttsError instanceof Error) {
-          const message = ttsError.message || 'No error message provided.'
-          const stack = ttsError.stack && !ttsError.stack.includes(message) ? ttsError.stack : ''
-          errorDetails = [`${ttsError.name}: ${message}`, stack].filter(Boolean).join('\n')
-        } else {
-          errorDetails = String(ttsError || 'Check your connection and try saving again.')
-        }
-        const traceDetails = (window.__promptLibraryTtsTrace ?? []).slice(-24).map((entry) => {
-          const { time, event, ...details } = entry
-          return `${time} ${event}${Object.keys(details).length ? ` ${JSON.stringify(details)}` : ''}`
-        }).join('\n')
-        if (traceDetails) errorDetails += `\n\nRecent TTS trace:\n${traceDetails}`
-        setGenerationError(`The default voice could not be generated:\n${errorDetails}`)
-        setGeneratingAudio(false)
-        return
+    setError('')
+    const savedPrompt = await onSave(getPromptPayload())
+    if (!savedPrompt) setError('The prompt could not be saved. Please try again.')
+  }
+
+  async function generateRecording() {
+    if (generatingAudio || recording || recordingStarting || !transcript.trim()) return
+    setGeneratingAudio(true)
+    setGenerationError('')
+    setGenerationProgress(null)
+    try {
+      const generatedAudio = await onGenerateRecording(promptIdRef.current, transcript.trim(), setGenerationProgress)
+      if (!isUsableRecording(generatedAudio)) throw new Error('The generated recording is empty.')
+      setGenerationProgress({ phase: 'complete' })
+      await new Promise((resolve) => window.setTimeout(resolve, 350))
+      setAudio(generatedAudio)
+      setAudioSource('tts')
+    } catch (ttsError) {
+      let errorDetails
+      if (ttsError instanceof Error) {
+        const message = ttsError.message || 'No error message provided.'
+        const stack = ttsError.stack && !ttsError.stack.includes(message) ? ttsError.stack : ''
+        errorDetails = [`${ttsError.name}: ${message}`, stack].filter(Boolean).join('\n')
+      } else {
+        errorDetails = String(ttsError || 'Check your connection and try again.')
       }
+      const traceDetails = (window.__promptLibraryTtsTrace ?? []).slice(-24).map((entry) => {
+        const { time, event, ...details } = entry
+        return `${time} ${event}${Object.keys(details).length ? ` ${JSON.stringify(details)}` : ''}`
+      }).join('\n')
+      if (traceDetails) errorDetails += `\n\nRecent TTS trace:\n${traceDetails}`
+      setGenerationError(`The recording could not be generated:\n${errorDetails}`)
+    } finally {
       setGeneratingAudio(false)
     }
-    onSave({
-      id: prompt?.id ?? makeId(),
-      speaker,
-      character,
-      audio: savedAudio,
-      audioSource: savedAudioSource,
-      trimSilence,
-      transcript: cleanTranscript,
-      createdAt: prompt?.createdAt ?? Date.now(),
-    })
   }
 
   return (
-    <div className="dialog-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+    <div className="dialog-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !generatingAudio && onClose()}>
       <section className="record-dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
         <div className="dialog-heading">
           <div>
-            <p className="eyebrow">{prompt ? 'EDIT RECORDING' : 'NEW RECORDING'} <span>///</span> {folderName}</p>
+            <p className="eyebrow">{prompt ? 'EDIT PROMPT' : 'NEW PROMPT'} <span>///</span> {folderName}</p>
             <h2 id="dialog-title">{prompt ? 'Edit prompt' : 'Add a prompt'}</h2>
           </div>
-          <button className="icon-button" type="button" aria-label="Close dialog" onClick={onClose}>{'\u00D7'}</button>
+          <button className="icon-button" type="button" aria-label="Close dialog" onClick={onClose} disabled={generatingAudio}>{'\u00D7'}</button>
         </div>
 
         <form onSubmit={submitPrompt}>
           <label className="field-label" htmlFor="prompt-character">Character <span className="optional-label">OPTIONAL</span></label>
-          <select id="prompt-character" className="text-field character-select" value={character} onChange={(event) => setCharacter(event.target.value)}>
+          <select id="prompt-character" className="text-field character-select" value={character} disabled={generatingAudio} onChange={(event) => setCharacter(event.target.value)}>
             <option value="">No character</option>
             {prompt?.character && !characters.includes(prompt.character) && <option value={prompt.character}>{prompt.character}</option>}
             {characters.map((name) => <option key={name} value={name}>{name}</option>)}
@@ -1064,6 +1161,7 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
                   type="button"
                   aria-pressed={speaker === option}
                   onClick={() => setSpeaker(option)}
+                  disabled={generatingAudio}
                 >
                   {option}
                 </button>
@@ -1074,19 +1172,50 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
           <div className="recorder-panel">
             <div className="recorder-status">
               <span className={recording ? 'record-indicator is-live' : 'record-indicator'} />
-              <span>{recording ? 'Recording in progress' : audio ? (audioSource === 'tts' ? 'Default voice ready' : 'Recording ready') : 'Ready to record'}</span>
+              <span className={usableAudio ? 'recording-ready-status' : 'missing-recording-status'}>{generatingAudio ? 'Generating recording' : recording ? 'Recording in progress' : usableAudio ? 'Recording available' : 'Recording needed for Run'}</span>
               <span className="recording-time">{formatTime(seconds)}</span>
             </div>
-            <button className={recording ? 'record-button is-recording' : 'record-button'} type="button" onClick={recording ? stopRecording : startRecording} disabled={recordingStarting}>
+            <button className={recording ? 'record-button is-recording' : 'record-button'} type="button" onClick={recording ? stopRecording : startRecording} disabled={recordingStarting || generatingAudio}>
               <span className="record-button-icon" aria-hidden="true">{recording ? '\u25A0' : '\u25CF'}</span>
-              {recording ? 'Stop recording' : recordingStarting ? 'Starting…' : audio ? 'Record again' : 'Start recording'}
+              {recording ? 'Stop recording' : recordingStarting ? 'Starting…' : usableAudio ? 'Re-record' : 'Record audio'}
             </button>
-            {audio && !recording && <AudioPlayer audio={audio} trimSilence={trimSilence} />}
+            {usableAudio && !recording && <AudioPlayer audio={audio} trimSilence={trimSilence} />}
+            <div className="recording-actions">
+              {(!usableAudio || audioSource === 'tts') && <button className="quiet-button generate-recording-button" type="button" onClick={generateRecording} disabled={generatingAudio || recording || recordingStarting || !transcript.trim()}>
+                {generatingAudio && <span className="generation-spinner" aria-hidden="true" />}
+                {generatingAudio ? ({ preparing: 'Preparing voice…', loading: 'Loading voice model…', synthesizing: 'Generating speech…', complete: 'Recording ready' }[generationPhase]) : usableAudio ? 'Generate replacement' : 'Generate recording'}
+              </button>}
+              <label className="quiet-button attach-recording-button">
+                Attach audio
+                <input type="file" accept="audio/*,.mp3,.m4a,.wav,.ogg,.webm" disabled={generatingAudio || recording || recordingStarting} onChange={(event) => {
+                  const file = event.target.files?.[0]
+                  if (file && isUsableRecording(file)) {
+                    setAudio(file)
+                    setAudioSource('user')
+                    setError('')
+                    setGenerationError('')
+                  } else if (file) setError('Choose a non-empty audio recording.')
+                  event.target.value = ''
+                }} />
+              </label>
+              {usableAudio && <button className="text-action remove-recording-button" type="button" disabled={generatingAudio || recording} onClick={() => { setAudio(null); setAudioSource('none'); setError(''); setGenerationError('') }}>Remove recording</button>}
+            </div>
+            {generatingAudio && <div className="recording-generation-progress" role="status" aria-live="polite">
+              <ol className="recording-generation-stages" aria-label="Recording generation stages">
+                {['Prepare', 'Load voice', 'Generate'].map((label, index) => (
+                  <li key={label} className={index < generationStage ? 'is-complete' : index === generationStage && generationStage < 3 ? 'is-current' : ''}>
+                    <span className="recording-generation-stage-marker" aria-hidden="true">{index < generationStage ? '✓' : index + 1}</span>
+                    <span>{label}</span>
+                  </li>
+                ))}
+              </ol>
+            </div>}
             {error && <p className="form-error" role="alert">{error}</p>}
+            {generationError && <p className="form-error recording-generation-error" role="alert">{generationError}</p>}
           </div>
 
           <label className="trim-silence-setting">
-            <input type="checkbox" checked={trimSilence} onChange={(event) => setTrimSilence(event.target.checked)} />
+            <input type="checkbox" checked={trimSilence} disabled={generatingAudio} onChange={(event) => setTrimSilence(event.target.checked)} />
             <span className="trim-silence-copy">
               <strong>Cut silence from start and end</strong>
               <span>Skip quiet audio before and after speech during playback.</span>
@@ -1101,11 +1230,13 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
             <textarea
               id="prompt-transcript"
               className="transcript-input"
+              disabled={generatingAudio}
               lang="en"
               spellCheck="true"
               value={transcript}
               onChange={(event) => {
                 const value = event.target.value
+                if (recording || recordingStartingRef.current) liveTranscriptionAllowedRef.current = false
                 setTranscript(value)
                 if (value.trim()) setTranscriptError('')
               }}
@@ -1115,15 +1246,9 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
             {transcriptError && <p className="form-error" role="alert">{transcriptError}</p>}
           </div>
           <div className="dialog-actions">
-            <button className="quiet-button" type="button" onClick={onClose}>Cancel</button>
+            <button className="quiet-button" type="button" onClick={onClose} disabled={generatingAudio}>Cancel</button>
             <div className="dialog-submit-group">
-              {(generatingAudio || generationError) && (
-                <div className={generationError ? 'generation-status is-error' : 'generation-status'} role={generationError ? 'alert' : 'status'} aria-live="polite">
-                  {generatingAudio && <span className="generation-spinner" aria-hidden="true" />}
-                  <span>{generatingAudio ? 'Generating default voice…' : generationError}</span>
-                </div>
-              )}
-              <button className="primary-button" type="submit" disabled={!transcript.trim() || recording || generatingAudio}>{prompt ? 'Save changes' : 'Done'} <span aria-hidden="true">{'\u2192'}</span></button>
+              <button className="primary-button" type="submit" disabled={!transcript.trim() || recording || recordingStarting || generatingAudio}>{prompt ? 'Save changes' : 'Save prompt'} <span aria-hidden="true">{'\u2192'}</span></button>
             </div>
           </div>
         </form>
@@ -1181,6 +1306,7 @@ function App() {
   const [isRunPaused, setIsRunPaused] = useState(false)
   const [isRunPrompterFullscreen, setIsRunPrompterFullscreen] = useState(false)
   const [runError, setRunError] = useState('')
+  const [runValidationPromptIds, setRunValidationPromptIds] = useState([])
   const [rehearsalView, setRehearsalView] = useState(null)
   const [isTeleprompterFullscreen, setIsTeleprompterFullscreen] = useState(false)
   const [isAddingCharacter, setIsAddingCharacter] = useState(false)
@@ -1196,6 +1322,7 @@ function App() {
   const rehearsalPanelRef = useRef(null)
   const runPrompterRef = useRef(null)
   const promptDragRef = useRef(null)
+  const ttsGeneratingPromptIdsRef = useRef(new Set())
   const selectedFolder = folders.find((folder) => folder.id === selectedFolderId)
   const folderPrompts = prompts
     .filter((prompt) => prompt.folderId === selectedFolderId)
@@ -1308,7 +1435,7 @@ function App() {
       return true
     } catch {
       setStorageError('This folder could not be saved. Check available browser storage.')
-      return false
+      return null
     }
   }
 
@@ -1355,33 +1482,53 @@ function App() {
         ? current.map((item) => item.id === savedPrompt.id ? savedPrompt : item)
         : [savedPrompt, ...current])
       if (closeDialog) setPromptDialog(null)
-      return true
+      return savedPrompt
     } catch {
-      setStorageError('This recording could not be saved. Check available browser storage.')
-      return false
+      setStorageError('This prompt could not be saved. Check available browser storage.')
+      return null
     }
+  }
+
+  async function generateRecordingForPrompt(promptId, transcript, onProgress) {
+    if (ttsGeneratingPromptIdsRef.current.has(promptId)) throw new Error('A recording is already being generated for this prompt.')
+    ttsGeneratingPromptIdsRef.current.add(promptId)
+    try {
+      const current = prompts.find((item) => item.id === promptId)
+      if (current && isUsableRecording(current.audio) && current.audioSource !== 'tts') {
+        throw new Error('This prompt already has a user recording. Remove or replace that recording explicitly first.')
+      }
+      const audio = await generateTtsAudio(transcript, onProgress)
+      if (!isUsableRecording(audio)) throw new Error('The generated audio was empty.')
+      return audio
+    } finally {
+      ttsGeneratingPromptIdsRef.current.delete(promptId)
+    }
+  }
+
+  function blockRunWhenRecordingsMissing(candidatePrompts, runName) {
+    const missingPrompts = candidatePrompts.filter((prompt) => prompt.type !== 'silence' && !isUsableRecording(prompt.audio))
+    setRunValidationPromptIds(missingPrompts.map((prompt) => prompt.id))
+    if (missingPrompts.length === 0) return false
+    setRunError(`Can't start ${runName}: ${missingPrompts.length} prompt${missingPrompts.length === 1 ? ' is' : 's are'} missing a usable recording. Add a recording to each prompt below.`)
+    return true
   }
 
   async function importScriptPrompts(lines, selectedCharacter, detectedCharacters) {
     if (!selectedFolder) throw new Error('Open a folder before importing a script.')
     const firstPosition = folderPrompts.reduce((latest, item, index) => Math.max(latest, item.position ?? index), -1) + 1
     const timestamp = Math.max(Date.now(), folderPrompts.reduce((latest, item) => Math.max(latest, item.createdAt ?? 0), 0) + 1)
-    const preparedPrompts = []
-    for (const [index, line] of lines.entries()) {
-      const audio = await generateTtsAudio(line.text.trim())
-      preparedPrompts.push({
+    const preparedPrompts = lines.map((line, index) => ({
         id: makeId(),
         folderId: selectedFolderId,
         speaker: line.character === selectedCharacter ? 'Myself' : 'Reader',
         character: line.character,
-        audio,
-        audioSource: 'tts',
+        audio: null,
+        audioSource: 'none',
         trimSilence: false,
-        transcript: line.text.trim(),
+        transcript: validateScriptDialogue(line.text).text,
         createdAt: timestamp + index,
         position: firstPosition + index,
-      })
-    }
+      }))
     const updatedCharacters = [...new Set([...(selectedFolder.characters ?? []), ...detectedCharacters])]
     if (updatedCharacters.length !== (selectedFolder.characters ?? []).length) {
       const savedFolder = await saveFolder({ ...selectedFolder, characters: updatedCharacters })
@@ -1398,6 +1545,8 @@ function App() {
   function editPrompt(prompt) {
     stopRun()
     stopRehearsal()
+    setRunError('')
+    setRunValidationPromptIds([])
     setPromptDialog({ prompt })
   }
 
@@ -2167,6 +2316,8 @@ function App() {
   }
 
   function startRehearsal() {
+    if (blockRunWhenRecordingsMissing(folderPrompts, 'Run With Me')) return
+    setRunError('')
     stopRun()
     stopRehearsal()
     const session = {
@@ -2431,12 +2582,13 @@ function App() {
   }
 
   async function runPrompts(startIndex = 0) {
+    const queue = runQueue
+    if (queue.length === 0) return
+    if (blockRunWhenRecordingsMissing(queue, 'Run')) return
     stopRehearsal()
     pendingRunSkipRef.current = null
     runPausedRef.current = false
     setIsRunPaused(false)
-    const queue = runQueue
-    if (queue.length === 0) return
 
     setRunError('')
     const session = playbackSessionRef.current + 1
@@ -2469,6 +2621,11 @@ function App() {
           break
         }
         continue
+      }
+
+      if (!prompt.audio) {
+        setRunError(`"${label}" has no usable recording. Edit the prompt and add one before running.`)
+        break
       }
 
       const objectUrl = URL.createObjectURL(prompt.audio)
@@ -2619,7 +2776,7 @@ function App() {
 
             <div className="page-heading folder-heading">
               <div>
-                <p className="eyebrow">FOLDER <span>///</span> {folderPrompts.length.toString().padStart(2, '0')} RECORDINGS</p>
+                <p className="eyebrow">FOLDER <span>///</span> {folderPrompts.length.toString().padStart(2, '0')} PROMPTS</p>
                 <h1>{selectedFolder.name}</h1>
               </div>
             </div>
@@ -2774,14 +2931,19 @@ function App() {
 
             {rehearsalView?.status === 'error' && <p className="run-error rehearsal-error" role="status">{rehearsalView.message}</p>}
 
-            {runError && <p className="run-error" role="status">{runError}</p>}
+            {runError && <div className="run-error" role="status"><p>{runError}</p>{runValidationPromptIds.map((id) => {
+              const missingPrompt = folderPrompts.find((prompt) => prompt.id === id)
+              if (!missingPrompt) return null
+              const promptNumber = folderPrompts.findIndex((prompt) => prompt.id === id) + 1
+              return <button className="missing-prompt-edit" key={id} type="button" onClick={() => editPrompt(missingPrompt)}>Edit {formatPromptLabel(missingPrompt, promptNumber)}</button>
+            })}</div>}
 
             {folderPrompts.length === 0 ? (
               <div className="empty-state">
                 <span className="empty-symbol" aria-hidden="true">{'\u25C9'}</span>
-                <h2>No prompts recorded</h2>
-                <p>Start with a voice recording and choose who is speaking.</p>
-                <button className="primary-button" type="button" onClick={() => setPromptDialog({})}>Record a prompt <span aria-hidden="true">{'\u2192'}</span></button>
+                <h2>No prompts yet</h2>
+                <p>Add a transcript, import a script, or record a line. Recording is optional.</p>
+                <button className="primary-button" type="button" onClick={() => setPromptDialog({})}>Add a prompt <span aria-hidden="true">{'\u2192'}</span></button>
               </div>
             ) : (
               <div className="prompt-list" aria-label="Prompts in chronological order">
@@ -2790,6 +2952,7 @@ function App() {
                     className={[
                       'prompt-row',
                       prompt.type === 'silence' && 'prompt-row-silence',
+                      prompt.type !== 'silence' && !isUsableRecording(prompt.audio) && 'prompt-row-no-audio',
                       draggedPromptId === prompt.id && 'is-dragging',
                       dragOverPromptId === prompt.id && draggedPromptId !== prompt.id && 'is-drag-over',
                     ].filter(Boolean).join(' ')}
@@ -2809,7 +2972,8 @@ function App() {
                         <>
                           {prompt.character && <p className="prompt-character">{prompt.character}</p>}
                           <p className="prompt-transcript">{prompt.transcript || 'No transcript available.'}</p>
-                          <p className="prompt-date">RECORDED {new Date(prompt.createdAt).toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }).toUpperCase()}</p>
+                          {!isUsableRecording(prompt.audio) && <span className="missing-recording-status prompt-missing-recording">Recording needed for Run</span>}
+                          <p className="prompt-date">{isUsableRecording(prompt.audio) ? 'RECORDED' : 'ADDED'} {new Date(prompt.createdAt).toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }).toUpperCase()}</p>
                         </>
                       )}
                     </div>
@@ -2819,10 +2983,10 @@ function App() {
                         <span>{silenceDurationSeconds(prompt)}s</span>
                         <button type="button" aria-label="Increase silence duration" disabled={!canReorderPrompts || silenceDurationSeconds(prompt) >= 600} onClick={() => adjustSilenceDuration(prompt, 1)}>+</button>
                       </div>
-                    ) : <AudioPlayer audio={prompt.audio} trimSilence={prompt.trimSilence} />}
+                    ) : isUsableRecording(prompt.audio) ? <AudioPlayer audio={prompt.audio} trimSilence={prompt.trimSilence} /> : <span className="prompt-audio-missing"><span aria-hidden="true">{'\u266A'}</span> Audio not added</span>}
                     <div className="prompt-actions">
-                      {prompt.type !== 'silence' && <button className="text-action" type="button" onClick={() => editPrompt(prompt)}>Edit</button>}
-                      <button className="text-action" type="button" onClick={() => deletePrompt(prompt)}>Delete</button>
+                      {prompt.type !== 'silence' && <button className="text-action prompt-edit-action" type="button" onClick={() => editPrompt(prompt)}><svg className="prompt-action-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m3 11.8-.7 2.9 2.9-.7L14 5.2 10.8 2 3 9.8v2Z" /><path d="m9.8 3 3.2 3.2" /></svg>Edit</button>}
+                      <button className="text-action prompt-delete-action" type="button" onClick={() => deletePrompt(prompt)}><svg className="prompt-action-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 4.5h9M6 4.5V3h4v1.5m1.5 0-.5 9h-6l-.5-9M6.5 7v4m3-4v4" /></svg>Delete</button>
                     </div>
                   </article>
                 ))}
@@ -2971,7 +3135,7 @@ function App() {
 
       {isImportingScript && selectedFolder && <ScriptImportDialog folderName={selectedFolder.name} onClose={() => setIsImportingScript(false)} onImport={importScriptPrompts} />}
       {folderDialog && <FolderDialog folder={folderDialog.folder} onClose={() => setFolderDialog(null)} onSave={saveFolder} />}
-      {promptDialog && selectedFolder && <PromptDialog folderName={selectedFolder.name} characters={selectedFolder.characters ?? []} prompt={promptDialog.prompt} onClose={() => setPromptDialog(null)} onSave={savePrompt} />}
+      {promptDialog && selectedFolder && <PromptDialog folderName={selectedFolder.name} characters={selectedFolder.characters ?? []} prompt={promptDialog.prompt} onClose={() => setPromptDialog(null)} onSave={savePrompt} onGenerateRecording={generateRecordingForPrompt} />}
     </main>
   )
 }
