@@ -11,7 +11,17 @@ let ttsModelPromise
 
 async function generateTtsAudio(text) {
   const { KokoroTTS } = await import('kokoro-js')
-  ttsModelPromise ??= KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-ONNX', { dtype: 'q8' })
+  if (!ttsModelPromise) {
+    const modelPromise = KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-ONNX', {
+      dtype: 'q8',
+      device: 'wasm',
+    })
+    const retryableModelPromise = modelPromise.catch((error) => {
+      if (ttsModelPromise === retryableModelPromise) ttsModelPromise = undefined
+      throw error
+    })
+    ttsModelPromise = retryableModelPromise
+  }
   const synthesizer = await ttsModelPromise
   const audio = await synthesizer.generate(text, { voice: 'af_bella' })
   return audio.toBlob()
@@ -620,6 +630,7 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
   const [recording, setRecording] = useState(false)
   const [seconds, setSeconds] = useState(0)
   const [error, setError] = useState('')
+  const [generationError, setGenerationError] = useState('')
   const [generatingAudio, setGeneratingAudio] = useState(false)
   const recorderRef = useRef(null)
   const recognitionRef = useRef(null)
@@ -721,12 +732,20 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
     const transcriptChanged = cleanTranscript !== (prompt?.transcript ?? '')
     if (!isUserRecording && (!audio || audioSource !== 'tts' || transcriptChanged)) {
       setGeneratingAudio(true)
-      setError('Generating the default voice. The first generation may take a little longer while the voice model loads.')
+      setGenerationError('')
       try {
         savedAudio = await generateTtsAudio(cleanTranscript)
         savedAudioSource = 'tts'
       } catch (ttsError) {
-        setError(`The default voice could not be generated: ${ttsError?.message || 'check your connection and try saving again.'}`)
+        let errorDetails
+        if (ttsError instanceof Error) {
+          const message = ttsError.message || 'No error message provided.'
+          const stack = ttsError.stack && !ttsError.stack.includes(message) ? ttsError.stack : ''
+          errorDetails = [`${ttsError.name}: ${message}`, stack].filter(Boolean).join('\n')
+        } else {
+          errorDetails = String(ttsError || 'Check your connection and try saving again.')
+        }
+        setGenerationError(`The default voice could not be generated:\n${errorDetails}`)
         setGeneratingAudio(false)
         return
       }
@@ -802,7 +821,6 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
             </span>
           </label>
 
-          {generatingAudio && <p className="loading-state" role="status">GENERATING DEFAULT VOICE...</p>}
           <div className="transcript-editor">
             <div className="transcript-label-row">
               <label className="field-label" htmlFor="prompt-transcript">Transcript</label>
@@ -826,7 +844,15 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave }) {
           </div>
           <div className="dialog-actions">
             <button className="quiet-button" type="button" onClick={onClose}>Cancel</button>
-            <button className="primary-button" type="submit" disabled={!transcript.trim() || recording || generatingAudio}>{generatingAudio ? 'Generating...' : prompt ? 'Save changes' : 'Done'} <span aria-hidden="true">{'\u2192'}</span></button>
+            <div className="dialog-submit-group">
+              {(generatingAudio || generationError) && (
+                <div className={generationError ? 'generation-status is-error' : 'generation-status'} role={generationError ? 'alert' : 'status'} aria-live="polite">
+                  {generatingAudio && <span className="generation-spinner" aria-hidden="true" />}
+                  <span>{generatingAudio ? 'Generating default voice…' : generationError}</span>
+                </div>
+              )}
+              <button className="primary-button" type="submit" disabled={!transcript.trim() || recording || generatingAudio}>{prompt ? 'Save changes' : 'Done'} <span aria-hidden="true">{'\u2192'}</span></button>
+            </div>
           </div>
         </form>
       </section>
