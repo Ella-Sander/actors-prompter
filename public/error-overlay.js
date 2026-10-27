@@ -2,6 +2,26 @@
   let errorNumber = 0
   let overlayShown = false
 
+  function recordRuntimeError(kind, details) {
+    const entry = {
+      time: new Date().toISOString(),
+      kind,
+      ...details,
+      active: {
+        rehearsal: window.__promptRehearsalRuntime ?? null,
+        playback: window.__promptAudioRuntime ?? null,
+        recording: window.__promptRecordingRuntime ?? null,
+        tts: window.__promptLibraryTtsStatus ?? null,
+        browserCapabilities: window.__promptBrowserCapabilities ?? null,
+      },
+    }
+    const trace = window.__promptGlobalErrorTrace ??= []
+    trace.push(entry)
+    if (trace.length > 30) trace.shift()
+    console.error('[Actors Prompter global failure]', entry)
+    return entry
+  }
+
   function showError(title, details) {
     if (overlayShown) return
     overlayShown = true
@@ -27,6 +47,15 @@
           return `${time} ${event}${Object.keys(data).length ? ` ${JSON.stringify(data)}` : ''}`
         }).join('\n')
       : ''
+    const audioTrace = Array.isArray(window.__promptAudioTrace)
+      ? window.__promptAudioTrace.slice(-16).map((entry) => {
+          const { time, event, ...data } = entry
+          return `${time} ${event}${Object.keys(data).length ? ` ${JSON.stringify(data)}` : ''}`
+        }).join('\n')
+      : ''
+    const globalErrorTrace = Array.isArray(window.__promptGlobalErrorTrace)
+      ? window.__promptGlobalErrorTrace.slice(-6).map((entry) => JSON.stringify(entry, null, 2)).join('\n\n')
+      : ''
 
     const screen = document.createElement('main')
     screen.id = 'runtime-error-overlay'
@@ -46,7 +75,9 @@
       rehearsalRuntime && `\nRun With Me state:\n${JSON.stringify(rehearsalRuntime)}`,
       rehearsalTrace && `\nRecent Run With Me trace:\n${rehearsalTrace}`,
       recordingTrace && `\nRecent prompt recording trace:\n${recordingTrace}`,
+      audioTrace && `\nRecent audio playback trace:\n${audioTrace}`,
       ttsTrace && `\nRecent TTS trace:\n${ttsTrace}`,
+      globalErrorTrace && `\nGlobal error context:\n${globalErrorTrace}`,
     ].filter(Boolean).join('\n')
 
     screen.append(heading, message, output)
@@ -71,22 +102,27 @@
   window.addEventListener('error', (event) => {
     if (event.target && event.target !== window) {
       const resource = event.target.src || event.target.href
-      if (resource) showError('A JavaScript or stylesheet resource failed to load.', resource)
+      if (resource) {
+        recordRuntimeError('resource-error', { resource, tagName: event.target.tagName || null })
+        showError('A JavaScript or stylesheet resource failed to load.', resource)
+      }
       return
     }
 
     const location = event.filename
       ? `${event.filename}${event.lineno ? `:${event.lineno}` : ''}${event.colno ? `:${event.colno}` : ''}`
       : ''
-    window.__promptLibraryTtsTrace ??= []
-    window.__promptLibraryTtsTrace.push({
-      time: new Date().toISOString(),
-      event: 'window-error',
+    const errorDetails = {
       message: event.message || 'Unknown window error',
-      location: location || null,
+      filename: event.filename || null,
+      lineno: event.lineno || null,
+      colno: event.colno || null,
+      stack: event.error?.stack || null,
       hasException: Boolean(event.error),
-      ttsStatus: window.__promptLibraryTtsStatus ?? null,
-    })
+    }
+    recordRuntimeError('window-error', errorDetails)
+    window.__promptLibraryTtsTrace ??= []
+    window.__promptLibraryTtsTrace.push({ time: new Date().toISOString(), event: 'window-error', ...errorDetails })
     const isOpaqueScriptError = event.message === 'Script error.' && !event.filename && !event.error
     const details = isOpaqueScriptError
       ? [
@@ -99,7 +135,15 @@
   }, true)
 
   window.addEventListener('unhandledrejection', (event) => {
-    showError('Unhandled JavaScript promise rejection.', describeError(event.reason))
+    const reason = event.reason
+    const rejection = {
+      message: reason instanceof Error ? reason.message : String(reason ?? 'Unknown rejection'),
+      name: reason instanceof Error ? reason.name : null,
+      stack: reason instanceof Error ? reason.stack || null : null,
+      details: describeError(reason),
+    }
+    recordRuntimeError('unhandled-rejection', rejection)
+    showError('Unhandled JavaScript promise rejection.', rejection.details)
   })
 
   window.addEventListener('securitypolicyviolation', (event) => {
@@ -118,6 +162,13 @@
       sourceFile: event.sourceFile || null,
       lineNumber: event.lineNumber || null,
       ttsStatus: window.__promptLibraryTtsStatus ?? null,
+    })
+    recordRuntimeError('csp-violation', {
+      directive: event.effectiveDirective || 'unknown',
+      blockedURI: event.blockedURI || 'unknown',
+      sourceFile: event.sourceFile || null,
+      lineNumber: event.lineNumber || null,
+      sample: event.sample || null,
     })
     showError('The browser blocked a resource or JavaScript operation under the site’s Content Security Policy.', details)
   })

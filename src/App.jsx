@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { blocksRecordingGeneration, findPromptInsertion, isRecoverableRecognitionInterruption, movePromptInList } from './promptBehavior.js'
 import ortWasmModuleUrl from '../node_modules/kokoro-js/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.mjs?url'
 import ortWasmBinaryUrl from '../node_modules/kokoro-js/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.wasm?url'
 import './App.css'
@@ -12,6 +13,8 @@ const audioBoundsCache = new WeakMap()
 let ttsModelPromise
 let ttsFetchTraceState
 let ttsGenerationQueue = Promise.resolve()
+const readerPitchGraphs = new WeakMap()
+let soundTouchRuntimePromise
 
 const NON_ENGLISH_CLUES = {
   Spanish: new Set(['el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 'que', 'qué', 'como', 'cómo', 'pero', 'porque', 'para', 'por', 'con', 'estoy', 'estas', 'estás', 'está', 'somos', 'tengo', 'tiene', 'quiero', 'puedo', 'hola', 'gracias', 'adios', 'adiós']),
@@ -51,6 +54,7 @@ function recordRehearsalTrace(session, event, details = {}) {
   const entry = {
     time: new Date().toISOString(),
     event,
+    sessionId: session?.sessionId ?? null,
     phase: session?.phase ?? 'none',
     prompt: session ? `${session.index + 1}/${session.lines.length}` : 'none',
     promptId: session?.lines?.[session.index]?.id ?? null,
@@ -100,7 +104,7 @@ function getWasmRuntimeCapabilities() {
 function recordPromptRecordingTrace(event, details = {}) {
   if (typeof window === 'undefined') return
   const entries = window.__promptRecordingTrace ??= []
-  entries.push({ time: new Date().toISOString(), event, ...details })
+  entries.push({ time: new Date().toISOString(), event, sessionId: window.__promptRecordingRuntime?.sessionId ?? null, ...details })
   if (entries.length > 30) entries.shift()
 }
 
@@ -209,9 +213,12 @@ function generateTtsAudio(text, onProgress) {
 
 async function generateTtsAudioNow(text, onProgress) {
   const stopFetchTrace = startTtsFetchTrace()
-  recordTtsTrace('generation-start', { transcriptLength: text.length })
+  recordTtsTrace('generation-start', { transcriptLength: text.length, secureContext: window.isSecureContext })
   onProgress?.({ phase: 'starting', progress: 0 })
   try {
+    if (!window.isSecureContext) {
+      throw new Error('Default voice generation requires HTTPS on an iPhone. Open the HTTPS LAN development URL; localhost is secure only on the computer running Vite.')
+    }
     ensureReadableStreamAsyncIterator()
     recordTtsTrace('module-import-start')
     const [{ KokoroTTS, env: kokoroEnv }, { env: transformersEnv }] = await Promise.all([
@@ -476,14 +483,6 @@ function readAll(storeName) {
   }))
 }
 
-function readRecord(storeName, id) {
-  return openDatabase().then((database) => new Promise((resolve, reject) => {
-    const request = database.transaction(storeName).objectStore(storeName).get(id)
-    request.onsuccess = () => resolve(request.result)
-    request.onerror = () => reject(request.error)
-  }))
-}
-
 function saveRecord(storeName, record) {
   return openDatabase().then((database) => new Promise((resolve, reject) => {
     const transaction = database.transaction(storeName, 'readwrite')
@@ -565,12 +564,81 @@ function silenceDurationSeconds(prompt) {
   return Number.isFinite(duration) ? Math.max(1, Math.min(600, duration)) : 3
 }
 
-function setReaderPlaybackPitch(audio, speaker, pitch) {
-  if (speaker !== 'Reader') return
-  audio.playbackRate = pitch
-  if ('preservesPitch' in audio) audio.preservesPitch = false
-  if ('mozPreservesPitch' in audio) audio.mozPreservesPitch = false
-  if ('webkitPreservesPitch' in audio) audio.webkitPreservesPitch = false
+async function prepareReaderPitch(audio, speaker, pitch) {
+  if (speaker !== 'Reader' || Math.abs(pitch - 1) < 0.001) return () => {}
+  if (!window.isSecureContext) {
+    throw new Error('Reader Pitch processing requires HTTPS on an iPhone. Open the HTTPS LAN development URL.')
+  }
+  if (typeof window.AudioWorkletNode !== 'function') {
+    throw new Error('This browser does not expose AudioWorkletNode. Reader Pitch needs a current Safari version on a trusted HTTPS origin.')
+  }
+  let graph = readerPitchGraphs.get(audio)
+  if (!graph) {
+    const AudioContextConstructor = window.AudioContext || window.webkitAudioContext
+    if (!AudioContextConstructor || !window.AudioWorkletNode) {
+      throw new Error('Independent Reader pitch shifting is not supported by this browser.')
+    }
+    const context = new AudioContextConstructor()
+    if (!context.audioWorklet) {
+      context.close().catch(() => {})
+      throw new Error('This browser does not support AudioWorklet processing for Reader Pitch.')
+    }
+    context.resume().catch(() => {})
+    graph = { context, source: null, node: null, ready: null }
+    readerPitchGraphs.set(audio, graph)
+    graph.ready = (async () => {
+      soundTouchRuntimePromise ??= Promise.all([
+        import('@soundtouchjs/audio-worklet'),
+        import('@soundtouchjs/audio-worklet/processor?url'),
+      ]).then(([soundTouchModule, processorModule]) => ({
+        SoundTouchNode: soundTouchModule.SoundTouchNode,
+        processorUrl: processorModule.default,
+      })).catch((error) => {
+        soundTouchRuntimePromise = undefined
+        throw error
+      })
+      const { SoundTouchNode, processorUrl } = await soundTouchRuntimePromise
+      await SoundTouchNode.register(context, processorUrl)
+      graph.source = context.createMediaElementSource(audio)
+      graph.node = new SoundTouchNode({ context })
+      graph.source.connect(graph.node)
+      graph.node.connect(context.destination)
+      audio.preservesPitch = false
+      audio.mozPreservesPitch = false
+      audio.webkitPreservesPitch = false
+    })().catch((error) => {
+      if (readerPitchGraphs.get(audio) === graph) readerPitchGraphs.delete(audio)
+      try { graph.source?.disconnect() } catch { /* no connection was created */ }
+      try { graph.node?.disconnect() } catch { /* no node was connected */ }
+      if (context.state !== 'closed') context.close().catch(() => {})
+      throw error
+    })
+  }
+  await graph.ready
+  if (graph.context.state === 'suspended') await graph.context.resume()
+  if (!graph.node) throw new Error('Reader pitch processor could not be initialized.')
+  graph.node.pitch.value = pitch
+  return () => {
+    const current = readerPitchGraphs.get(audio)
+    if (current !== graph) return
+    readerPitchGraphs.delete(audio)
+    try { graph.source?.disconnect() } catch { /* already disconnected */ }
+    try { graph.node?.disconnect() } catch { /* already disconnected */ }
+    if (graph.context.state !== 'closed') graph.context.close().catch(() => {})
+  }
+}
+
+async function resumeReaderPitch(audio) {
+  const graph = readerPitchGraphs.get(audio)
+  if (graph?.context.state === 'suspended') await graph.context.resume()
+}
+
+function recordPromptAudioTrace(event, details = {}) {
+  if (typeof window === 'undefined') return
+  const entries = window.__promptAudioTrace ??= []
+  entries.push({ time: new Date().toISOString(), event, ...details })
+  if (entries.length > 40) entries.shift()
+  console.info('[Prompt audio trace]', entries.at(-1))
 }
 
 function formatPromptLabel(prompt, sequenceNumber) {
@@ -655,6 +723,7 @@ function stopRehearsalReaderPlayback(session) {
   window.clearInterval(session.readerCountdownTimer)
   session.readerCountdownTimer = null
   const { audio, objectUrl } = playback
+  playback.pitchCleanup?.()
   audio.onended = null
   audio.onerror = null
   playback.trimCleanup?.()
@@ -673,6 +742,8 @@ function disposeRehearsalSession(session) {
   session.readerCountdownTimer = null
   window.clearTimeout(session.advanceTimer)
   session.advanceTimer = null
+  window.clearTimeout(session.recognitionRecoveryTimer)
+  session.recognitionRecoveryTimer = null
   window.clearTimeout(session.silenceTimer)
   session.silenceTimer = null
   window.clearInterval(session.silenceCountdownInterval)
@@ -685,6 +756,7 @@ function disposeRehearsalSession(session) {
     session.recognition.abort()
     session.recognition = null
   }
+  session.readerAudio?.pitchCleanup?.()
   stopRehearsalReaderPlayback(session)
 }
 
@@ -711,10 +783,13 @@ function RunControlIcon({ name }) {
   )
 }
 
-function AudioPlayer({ audio, trimSilence = false }) {
+function AudioPlayer({ audio, trimSilence = false, speaker = 'Myself', pitch = 1, promptId = null }) {
   const [source, setSource] = useState('')
   const [playbackDuration, setPlaybackDuration] = useState(null)
+  const [playbackError, setPlaybackError] = useState('')
   const playerRef = useRef(null)
+  const pitchRef = useRef(pitch)
+  pitchRef.current = pitch
 
   useEffect(() => {
     const objectUrl = URL.createObjectURL(audio)
@@ -726,6 +801,12 @@ function AudioPlayer({ audio, trimSilence = false }) {
     const player = playerRef.current
     if (!player) return undefined
     let disposed = false
+    let pitchPreparing = false
+    let trimPreparing = false
+    let bounds = null
+    let pitchCleanup = () => {}
+    const boundsPromise = trimSilence ? getAudioBounds(audio) : null
+    const traceDetails = { promptId, speaker, source: 'prompt-list' }
     async function updatePlaybackDuration() {
       setPlaybackDuration(null)
       await waitForAudioMetadata(player)
@@ -743,45 +824,100 @@ function AudioPlayer({ audio, trimSilence = false }) {
       setPlaybackDuration(end > start ? end - start : sourceDuration)
     }
     updatePlaybackDuration()
-    if (!trimSilence) return () => { disposed = true }
-    let preparing = false
-    let bounds = null
-    const boundsPromise = getAudioBounds(audio)
     const handlePlay = async () => {
-      if (preparing) {
+      const selectedPitch = pitchRef.current
+      window.__promptAudioRuntime = { mode: 'Audio player', promptId, speaker, pitch: selectedPitch, phase: 'play-requested' }
+      recordPromptAudioTrace('media-play-requested', { ...traceDetails, pitch: selectedPitch })
+      if (pitchPreparing || trimPreparing) {
         player.pause()
         return
       }
-      if (!bounds) {
-        preparing = true
+      if (speaker === 'Reader' && Math.abs(selectedPitch - 1) >= 0.001 && !readerPitchGraphs.has(player)) {
+        pitchPreparing = true
         player.pause()
-        const detectedBounds = await boundsPromise
-        if (disposed) return
-        bounds = {
-          start: detectedBounds.start,
-          end: detectedBounds.end || player.duration,
+        setPlaybackError('')
+        recordPromptAudioTrace('pitch-setup-start', { ...traceDetails, pitch: selectedPitch })
+        try {
+          pitchCleanup = await prepareReaderPitch(player, speaker, selectedPitch)
+          recordPromptAudioTrace('pitch-setup-ready', { ...traceDetails, pitch: selectedPitch })
+        } catch (error) {
+          const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+          setPlaybackError(`Reader pitch could not be applied: ${message}`)
+          recordPromptAudioTrace('pitch-setup-failed', { ...traceDetails, pitch: selectedPitch, error: message, stack: error instanceof Error ? error.stack : undefined })
+          pitchPreparing = false
+          return
         }
-        preparing = false
-        if (player.currentTime < bounds.start || player.currentTime >= bounds.end) player.currentTime = bounds.start
-        player.play().catch(() => {})
+        pitchPreparing = false
+        if (disposed) return
+        if (trimSilence) {
+          const detectedBounds = await boundsPromise
+          if (disposed) return
+          bounds = { start: detectedBounds.start, end: detectedBounds.end || player.duration }
+          if (player.currentTime < bounds.start || player.currentTime >= bounds.end) player.currentTime = bounds.start
+        }
+        player.play().catch((error) => {
+          recordPromptAudioTrace('play-rejected', { ...traceDetails, error: error?.message ?? String(error) })
+          setPlaybackError(`Audio playback could not start: ${error?.message ?? 'browser rejected playback'}`)
+        })
         return
       }
-      if (player.currentTime < bounds.start || player.currentTime >= bounds.end) player.currentTime = bounds.start
+      if (trimSilence && !bounds) {
+        trimPreparing = true
+        player.pause()
+        try {
+          const detectedBounds = await boundsPromise
+          if (disposed) return
+          bounds = { start: detectedBounds.start, end: detectedBounds.end || player.duration }
+          if (player.currentTime < bounds.start || player.currentTime >= bounds.end) player.currentTime = bounds.start
+          trimPreparing = false
+          player.play().catch((error) => {
+            recordPromptAudioTrace('play-rejected', { ...traceDetails, error: error?.message ?? String(error) })
+            setPlaybackError(`Audio playback could not start: ${error?.message ?? 'browser rejected playback'}`)
+          })
+        } catch (error) {
+          trimPreparing = false
+          setPlaybackError(`Trimmed audio could not be prepared: ${error?.message ?? String(error)}`)
+        }
+        return
+      }
+      if (bounds && (player.currentTime < bounds.start || player.currentTime >= bounds.end)) player.currentTime = bounds.start
     }
     const handleTimeUpdate = () => {
-      if (bounds && player.currentTime >= bounds.end) {
+      if (trimSilence && bounds && player.currentTime >= bounds.end) {
         player.pause()
         player.currentTime = bounds.end
       }
     }
+    const handleError = () => {
+      window.__promptAudioRuntime = { mode: 'Audio player', promptId, speaker, pitch: pitchRef.current, phase: 'error', mediaErrorCode: player.error?.code ?? null }
+      recordPromptAudioTrace('media-error', { ...traceDetails, mediaErrorCode: player.error?.code ?? null })
+      setPlaybackError(`Audio could not be played (media error ${player.error?.code ?? 'unknown'}).`)
+    }
+    const handleMetadata = () => recordPromptAudioTrace('media-metadata-ready', { ...traceDetails, duration: Number.isFinite(player.duration) ? player.duration : null, readyState: player.readyState })
+    const handleEnded = () => {
+      window.__promptAudioRuntime = { mode: 'Audio player', promptId, speaker, pitch: pitchRef.current, phase: 'ended' }
+      recordPromptAudioTrace('media-ended', traceDetails)
+    }
     player.addEventListener('play', handlePlay)
     player.addEventListener('timeupdate', handleTimeUpdate)
+    player.addEventListener('error', handleError)
+    player.addEventListener('loadedmetadata', handleMetadata)
+    player.addEventListener('ended', handleEnded)
     return () => {
       disposed = true
+      pitchCleanup()
       player.removeEventListener('play', handlePlay)
       player.removeEventListener('timeupdate', handleTimeUpdate)
+      player.removeEventListener('error', handleError)
+      player.removeEventListener('loadedmetadata', handleMetadata)
+      player.removeEventListener('ended', handleEnded)
     }
-  }, [audio, source, trimSilence])
+  }, [audio, source, trimSilence, speaker, promptId])
+
+  useEffect(() => {
+    const graph = playerRef.current && readerPitchGraphs.get(playerRef.current)
+    if (graph?.node && speaker === 'Reader') graph.node.pitch.value = pitch
+  }, [audio, pitch, speaker])
 
   return source ? (
     <div className={`audio-player-group${trimSilence ? ' is-trimmed' : ''}`}>
@@ -792,6 +928,7 @@ function AudioPlayer({ audio, trimSilence = false }) {
         </div>
       )}
       <audio ref={playerRef} className="audio-player" controls preload="metadata" src={source}>Audio playback is not supported.</audio>
+      {playbackError && <p className="audio-playback-error" role="alert">{playbackError}</p>}
     </div>
   ) : null
 }
@@ -900,7 +1037,7 @@ function ScriptImportDialog({ folderName, onClose, onImport }) {
   )
 }
 
-function PromptDialog({ folderName, characters, prompt, onClose, onSave, onGenerateRecording }) {
+function PromptDialog({ folderName, characters, prompt, readerPitch, onClose, onSave, onGenerateRecording }) {
   const [speaker, setSpeaker] = useState(prompt?.speaker ?? 'Myself')
   const [character, setCharacter] = useState(prompt?.character ?? '')
   const [audio, setAudio] = useState(prompt?.audio ?? null)
@@ -951,6 +1088,15 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave, onGener
     setTranscriptNotice('')
     setTranscriptError('')
     setSeconds(0)
+    window.__promptRecordingRuntime = { sessionId: makeId(), promptId: prompt?.id ?? promptIdRef.current, phase: 'requesting-microphone' }
+
+    if (!window.isSecureContext) {
+      recordPromptRecordingTrace('unsupported-insecure-context', { secureContext: false, promptId: prompt?.id ?? 'new' })
+      setError('Microphone recording requires HTTPS on your iPhone. The HTTP LAN link can load the app, but browsers block microphone access there.')
+      recordingStartingRef.current = false
+      setRecordingStarting(false)
+      return
+    }
 
     if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
       recordPromptRecordingTrace('unsupported', {
@@ -988,6 +1134,7 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave, onGener
         liveTranscriptionAllowedRef.current = false
         const clip = new Blob(chunksRef.current, { type: recorder.mimeType || supportedMimeType || 'audio/webm' })
         recordPromptRecordingTrace('recorder-stopped', { bytes: clip.size, failed: recordingFailedRef.current })
+        window.__promptRecordingRuntime = { ...window.__promptRecordingRuntime, promptId: prompt?.id ?? promptIdRef.current, phase: 'stopped', bytes: clip.size, failed: recordingFailedRef.current }
         if (clip.size > 0 && !recordingFailedRef.current) {
           setAudio(clip)
           setAudioSource('user')
@@ -1008,6 +1155,7 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave, onGener
       }
       recorder.start()
       setRecording(true)
+      window.__promptRecordingRuntime = { ...window.__promptRecordingRuntime, promptId: prompt?.id ?? promptIdRef.current, phase: 'recording', mimeType: recorder.mimeType || supportedMimeType || 'browser-default' }
       recordPromptRecordingTrace('recorder-started', { mimeType: recorder.mimeType || supportedMimeType || 'browser-default' })
 
       // Start optional transcription only after the microphone recorder is running.
@@ -1051,6 +1199,7 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave, onGener
       recognitionRef.current = null
       recorderRef.current = null
       setRecording(false)
+      window.__promptRecordingRuntime = { ...window.__promptRecordingRuntime, promptId: prompt?.id ?? promptIdRef.current, phase: 'error', error: recordingError instanceof Error ? `${recordingError.name}: ${recordingError.message}` : String(recordingError) }
       setError('Microphone access was unavailable. Allow microphone access and try again.')
     } finally {
       recordingStartingRef.current = false
@@ -1068,6 +1217,7 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave, onGener
       // Recognition is optional; stopping the audio recorder remains authoritative.
     }
     const recorder = recorderRef.current
+    if (window.__promptRecordingRuntime) window.__promptRecordingRuntime = { ...window.__promptRecordingRuntime, phase: 'stopping' }
     recordPromptRecordingTrace('stop-requested', { recorderState: recorder?.state ?? 'missing' })
     if (recorder?.state === 'recording') recorder.stop()
   }
@@ -1105,13 +1255,17 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave, onGener
     setGeneratingAudio(true)
     setGenerationError('')
     setGenerationProgress(null)
+    recordTtsTrace('generation-requested', { promptId: prompt?.id ?? promptIdRef.current, transcriptLength: transcript.trim().length })
     try {
-      const generatedAudio = await onGenerateRecording(promptIdRef.current, transcript.trim(), setGenerationProgress)
+          const generatedAudio = await onGenerateRecording(promptIdRef.current, transcript.trim(), setGenerationProgress, {
+            userRecordingRemoved: Boolean(prompt?.audioSource !== 'tts' && isUsableRecording(prompt?.audio) && !usableAudio && audioSource === 'none'),
+          })
       if (!isUsableRecording(generatedAudio)) throw new Error('The generated recording is empty.')
       setGenerationProgress({ phase: 'complete' })
       await new Promise((resolve) => window.setTimeout(resolve, 350))
       setAudio(generatedAudio)
       setAudioSource('tts')
+      recordTtsTrace('generated-audio-attached', { promptId: prompt?.id ?? promptIdRef.current, audioBytes: generatedAudio.size, transcriptLength: transcript.trim().length })
     } catch (ttsError) {
       let errorDetails
       if (ttsError instanceof Error) {
@@ -1179,7 +1333,7 @@ function PromptDialog({ folderName, characters, prompt, onClose, onSave, onGener
               <span className="record-button-icon" aria-hidden="true">{recording ? '\u25A0' : '\u25CF'}</span>
               {recording ? 'Stop recording' : recordingStarting ? 'Starting…' : usableAudio ? 'Re-record' : 'Record audio'}
             </button>
-            {usableAudio && !recording && <AudioPlayer audio={audio} trimSilence={trimSilence} />}
+            {usableAudio && !recording && <AudioPlayer audio={audio} trimSilence={trimSilence} speaker={speaker} pitch={readerPitch} promptId={prompt?.id ?? promptIdRef.current} />}
             <div className="recording-actions">
               {(!usableAudio || audioSource === 'tts') && <button className="quiet-button generate-recording-button" type="button" onClick={generateRecording} disabled={generatingAudio || recording || recordingStarting || !transcript.trim()}>
                 {generatingAudio && <span className="generation-spinner" aria-hidden="true" />}
@@ -1302,6 +1456,8 @@ function App() {
   const [isLightMode, setIsLightMode] = useState(false)
   const [runSpeakers, setRunSpeakers] = useState({ Myself: false, Reader: true })
   const [readerPitch, setReaderPitch] = useState(1)
+  const readerPitchRef = useRef(readerPitch)
+  readerPitchRef.current = readerPitch
   const [runStatus, setRunStatus] = useState(null)
   const [isRunPaused, setIsRunPaused] = useState(false)
   const [isRunPrompterFullscreen, setIsRunPrompterFullscreen] = useState(false)
@@ -1315,6 +1471,7 @@ function App() {
   const [draggedPromptId, setDraggedPromptId] = useState(null)
   const [dragOverPromptId, setDragOverPromptId] = useState(null)
   const [dragDropPosition, setDragDropPosition] = useState('before')
+  const dragOverlayRef = useRef(null)
   const activePlaybackRef = useRef(null)
   const pendingRunSkipRef = useRef(null)
   const runPausedRef = useRef(false)
@@ -1490,12 +1647,12 @@ function App() {
     }
   }
 
-  async function generateRecordingForPrompt(promptId, transcript, onProgress) {
+  async function generateRecordingForPrompt(promptId, transcript, onProgress, { userRecordingRemoved = false } = {}) {
     if (ttsGeneratingPromptIdsRef.current.has(promptId)) throw new Error('A recording is already being generated for this prompt.')
     ttsGeneratingPromptIdsRef.current.add(promptId)
     try {
       const current = prompts.find((item) => item.id === promptId)
-      if (current && isUsableRecording(current.audio) && current.audioSource !== 'tts') {
+      if (blocksRecordingGeneration(current, userRecordingRemoved, isUsableRecording)) {
         throw new Error('This prompt already has a user recording. Remove or replace that recording explicitly first.')
       }
       const audio = await generateTtsAudio(transcript, onProgress)
@@ -1562,14 +1719,8 @@ function App() {
 
   async function reorderPrompts(draggedId, targetId, position = 'before') {
     if (!draggedId || draggedId === targetId || runStatus || (rehearsalView && !['completed', 'error'].includes(rehearsalView.status))) return
-    const ordered = [...folderPrompts]
-    const draggedIndex = ordered.findIndex((prompt) => prompt.id === draggedId)
-    let targetIndex = ordered.findIndex((prompt) => prompt.id === targetId)
-    if (draggedIndex < 0 || targetIndex < 0) return
-
-    const [draggedPrompt] = ordered.splice(draggedIndex, 1)
-    targetIndex = ordered.findIndex((prompt) => prompt.id === targetId)
-    ordered.splice(targetIndex + (position === 'after' ? 1 : 0), 0, draggedPrompt)
+    const ordered = movePromptInList(folderPrompts, draggedId, targetId, position)
+    if (ordered === folderPrompts) return
     const positioned = ordered.map((prompt, position) => ({ ...prompt, position }))
 
     try {
@@ -1596,8 +1747,19 @@ function App() {
       !dragHandle ||
       (event.target.closest('button, input, select, audio') && !dragHandle)
     ) return
-    promptDragRef.current = { promptId, pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, active: false }
-    event.currentTarget.setPointerCapture(event.pointerId)
+    const bounds = event.currentTarget.getBoundingClientRect()
+    promptDragRef.current = {
+      promptId,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      offsetX: event.clientX - bounds.left,
+      offsetY: event.clientY - bounds.top,
+      width: bounds.width,
+      height: bounds.height,
+      active: false,
+    }
+    try { event.currentTarget.setPointerCapture(event.pointerId) } catch { /* the browser may cancel capture during touch handoff */ }
   }
 
   function movePromptDrag(event) {
@@ -1607,25 +1769,84 @@ function App() {
     drag.active = true
     document.body.classList.add('is-reordering-prompts')
     event.preventDefault()
-    setDraggedPromptId(drag.promptId)
-    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest('[data-prompt-id]')
-    setDragOverPromptId(target?.dataset.promptId ?? null)
-    if (target) {
-      const bounds = target.getBoundingClientRect()
-      setDragDropPosition(event.clientY >= bounds.top + bounds.height / 2 ? 'after' : 'before')
+    if (!dragOverlayRef.current) {
+      const source = [...document.querySelectorAll('[data-prompt-id]')].find((element) => element.dataset.promptId === drag.promptId)
+      if (source) {
+        const overlay = source.cloneNode(true)
+        overlay.classList.remove('is-drag-over', 'is-drop-before', 'is-drop-after', 'is-drag-source')
+        overlay.classList.add('is-dragging', 'prompt-drag-overlay')
+        overlay.setAttribute('aria-hidden', 'true')
+        const sourceNodes = [source, ...source.querySelectorAll('*')]
+        const overlayNodes = [overlay, ...overlay.querySelectorAll('*')]
+        sourceNodes.forEach((sourceNode, index) => {
+          const computed = window.getComputedStyle(sourceNode)
+          for (let propertyIndex = 0; propertyIndex < computed.length; propertyIndex += 1) {
+            const property = computed.item(propertyIndex)
+            if (index === 0 && ['position', 'left', 'top', 'width', 'height', 'margin', 'transform', 'box-shadow', 'opacity', 'z-index', 'pointer-events'].includes(property)) continue
+            overlayNodes[index].style.setProperty(property, computed.getPropertyValue(property))
+          }
+        })
+        const appStyles = window.getComputedStyle(document.querySelector('.app-shell'))
+        for (let propertyIndex = 0; propertyIndex < appStyles.length; propertyIndex += 1) {
+          const property = appStyles.item(propertyIndex)
+          if (property.startsWith('--tone-')) overlay.style.setProperty(property, appStyles.getPropertyValue(property))
+        }
+        overlay.querySelectorAll('[id]').forEach((element) => element.removeAttribute('id'))
+        overlay.querySelectorAll('audio,button,input,select,textarea').forEach((element) => { element.style.opacity = '0'; element.tabIndex = -1 })
+        overlay.style.position = 'fixed'
+        overlay.style.left = `${event.clientX - drag.offsetX}px`
+        overlay.style.top = `${event.clientY - drag.offsetY}px`
+        overlay.style.width = `${drag.width}px`
+        overlay.style.height = `${drag.height}px`
+        overlay.style.margin = '0'
+        overlay.style.zIndex = '9999'
+        overlay.style.pointerEvents = 'none'
+        document.body.appendChild(overlay)
+        dragOverlayRef.current = overlay
+      }
     }
+    if (dragOverlayRef.current) {
+      dragOverlayRef.current.style.left = `${event.clientX - drag.offsetX}px`
+      dragOverlayRef.current.style.top = `${event.clientY - drag.offsetY}px`
+    }
+    setDraggedPromptId(drag.promptId)
+    const location = getPromptDropLocation(event, drag.promptId)
+    setDragOverPromptId(location?.targetId ?? null)
+    if (location) setDragDropPosition(location.position)
+  }
+
+  function getPromptDropLocation(event, draggedId) {
+    const list = document.querySelector('.prompt-list')
+    const overlay = dragOverlayRef.current
+    if (!list || !overlay) return null
+    const listBounds = list.getBoundingClientRect()
+    if (event.clientX < listBounds.left || event.clientX > listBounds.right) return null
+    const rows = [...list.querySelectorAll('[data-prompt-id]')]
+      .filter((row) => row.dataset.promptId !== draggedId)
+      .map((row) => {
+        const bounds = row.getBoundingClientRect()
+        return { id: row.dataset.promptId, top: bounds.top, height: bounds.height }
+      })
+    const overlayBounds = overlay.getBoundingClientRect()
+    const itemCenterY = overlayBounds.top + overlayBounds.height / 2
+    if (rows.length === 0) return null
+    return findPromptInsertion(rows, draggedId, itemCenterY)
   }
 
   function finishPromptDrag(event) {
     const drag = promptDragRef.current
     if (!drag || drag.pointerId !== event.pointerId) return
-    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest('[data-prompt-id]')
-    if (drag.active && target) {
-      const bounds = target.getBoundingClientRect()
-      const position = event.clientY >= bounds.top + bounds.height / 2 ? 'after' : 'before'
-      reorderPrompts(drag.promptId, target.dataset.promptId, position)
+    if (drag.active && dragOverlayRef.current) {
+      dragOverlayRef.current.style.left = `${event.clientX - drag.offsetX}px`
+      dragOverlayRef.current.style.top = `${event.clientY - drag.offsetY}px`
+    }
+    const location = drag.active ? getPromptDropLocation(event, drag.promptId) : null
+    if (location) {
+      reorderPrompts(drag.promptId, location.targetId, location.position)
     }
     promptDragRef.current = null
+    dragOverlayRef.current?.remove()
+    dragOverlayRef.current = null
     document.body.classList.remove('is-reordering-prompts')
     setDraggedPromptId(null)
     setDragOverPromptId(null)
@@ -1634,6 +1855,8 @@ function App() {
 
   function cancelPromptDrag() {
     promptDragRef.current = null
+    dragOverlayRef.current?.remove()
+    dragOverlayRef.current = null
     document.body.classList.remove('is-reordering-prompts')
     setDraggedPromptId(null)
     setDragOverPromptId(null)
@@ -1693,6 +1916,7 @@ function App() {
       activePlaybackRef.current = null
     }
     setRunStatus(null)
+    window.__promptAudioRuntime = null
   }
 
   function skipRunPrompt() {
@@ -1714,6 +1938,7 @@ function App() {
     setIsRunPaused(true)
     playback.paused = true
     playback.pause?.()
+    if (window.__promptAudioRuntime) window.__promptAudioRuntime = { ...window.__promptAudioRuntime, phase: 'paused' }
   }
 
   function resumeRun() {
@@ -1723,6 +1948,7 @@ function App() {
     setIsRunPaused(false)
     playback.paused = false
     playback.resume?.()
+    if (window.__promptAudioRuntime) window.__promptAudioRuntime = { ...window.__promptAudioRuntime, phase: 'playing' }
   }
 
   function restartRun() {
@@ -1831,6 +2057,8 @@ function App() {
       recordRehearsalTrace(session, 'phase', { status, speaker: line?.speaker ?? line?.type ?? 'none' })
     }
     window.__promptRehearsalRuntime = {
+      sessionId: session.sessionId,
+      promptId: line?.id ?? null,
       phase: status,
       prompt: `${Math.max(0, session.index + 1)}/${session.lines.length}`,
       speaker: line?.speaker ?? line?.type ?? 'none',
@@ -1877,6 +2105,7 @@ function App() {
     session.message = 'Script complete.'
     stopRehearsalVoiceMonitor(session)
     updateRehearsalView(session, 'completed')
+    window.__promptRehearsalRuntime = { sessionId: session.sessionId, promptId: null, phase: 'completed', prompt: `${session.lines.length}/${session.lines.length}`, speaker: 'none' }
   }
 
   function scheduleMyselfAdvance(session) {
@@ -2038,6 +2267,10 @@ function App() {
 
   function startRehearsalListening(session) {
     if (rehearsalSessionRef.current !== session || session.phase === 'paused') return
+    if (!window.isSecureContext) {
+      failRehearsal(session, 'Speech recognition requires HTTPS on your iPhone. Open the HTTPS LAN development URL and allow microphone access.')
+      return
+    }
     const SpeechRecognitionApi = window.SpeechRecognition || window.webkitSpeechRecognition
     if (!SpeechRecognitionApi) {
       failRehearsal(session, 'Speech recognition is not supported in this browser.')
@@ -2063,6 +2296,8 @@ function App() {
       session.advanceTimer = null
       session.advancedLineIndex = null
       session.activeLineIndex = session.index
+      session.recognitionRecoveryAttempts = 0
+      session.recognitionRecoveryTimer = null
       if (!session.triggerWord || session.expectedCount === 0) {
         failRehearsal(session, `${formatPromptLabel(line, session.index + 1)} has no usable final word in its transcript.`)
         return
@@ -2147,6 +2382,10 @@ function App() {
     recognition.onerror = (event) => {
       recordRehearsalTrace(session, 'recognition-error', { error: event.error ?? 'unknown' })
       if (rehearsalSessionRef.current !== session || session.recognition !== recognition || !['listening', 'speech-end'].includes(session.phase)) return
+      if (isRecoverableRecognitionInterruption(event.error)) {
+        session.recognitionInterrupted = true
+        return
+      }
       if (event.error === 'no-speech') {
         session.message = 'No speech detected. Keep speaking or try the line again.'
         updateRehearsalView(session, 'listening')
@@ -2174,7 +2413,20 @@ function App() {
       } else if (session.triggerSatisfied && session.speechEnded) {
         scheduleMyselfAdvance(session)
       } else if (['listening', 'waiting', 'speech-end'].includes(session.phase)) {
-        startRehearsalListening(session)
+        if (session.recognitionRecoveryAttempts >= 2) {
+          failRehearsal(session, 'Speech recognition stopped repeatedly. Check microphone access or restart rehearsal to try again.')
+          return
+        }
+        session.recognitionRecoveryAttempts += 1
+        const delay = session.recognitionInterrupted ? 250 : 500
+        session.recognitionInterrupted = false
+        recordRehearsalTrace(session, 'recognition-retry-scheduled', { attempt: session.recognitionRecoveryAttempts, delayMs: delay })
+        session.recognitionRecoveryTimer = window.setTimeout(() => {
+          session.recognitionRecoveryTimer = null
+          if (rehearsalSessionRef.current === session && ['listening', 'waiting', 'speech-end'].includes(session.phase) && !session.recognition) {
+            startRehearsalListening(session)
+          }
+        }, delay)
       } else {
         updateRehearsalView(session, session.phase)
       }
@@ -2232,8 +2484,7 @@ function App() {
     updateRehearsalView(session, 'speaking')
     const objectUrl = URL.createObjectURL(line.audio)
     const audio = new Audio(objectUrl)
-    setReaderPlaybackPitch(audio, 'Reader', readerPitch)
-    const playback = { audio, objectUrl }
+    const playback = { audio, objectUrl, pitchCleanup: null }
     session.readerAudio = playback
     const finishPlayback = () => {
       if (rehearsalSessionRef.current !== session || session.readerAudio !== playback || session.phase !== 'speaking') return
@@ -2242,6 +2493,7 @@ function App() {
       audio.onended = null
       audio.onerror = null
       playback.trimCleanup?.()
+      playback.pitchCleanup?.()
       URL.revokeObjectURL(objectUrl)
       session.readerAudio = null
       session.index += 1
@@ -2254,6 +2506,7 @@ function App() {
       failRehearsal(session, `The Reader recording ${formatPromptLabel(line, session.index + 1)} could not be played.`)
     }
     const preparePlayback = async () => {
+      playback.pitchCleanup = await prepareReaderPitch(audio, 'Reader', readerPitchRef.current)
       if (!line.trimSilence) await waitForAudioMetadata(audio)
       return prepareAudioTrim(audio, line.audio, line.trimSilence, finishPlayback)
     }
@@ -2261,6 +2514,7 @@ function App() {
       playback.trimCleanup = cleanup
       if (rehearsalSessionRef.current !== session || session.readerAudio !== playback) {
         cleanup()
+        playback.pitchCleanup?.()
         return
       }
       if (session.phase !== 'speaking') {
@@ -2281,6 +2535,7 @@ function App() {
         failRehearsal(session, 'Reader playback could not be started. Restart rehearsal to try again.')
       }
     }).catch((error) => {
+      if (rehearsalSessionRef.current !== session || session.readerAudio !== playback) playback.pitchCleanup?.()
       recordRehearsalTrace(session, 'reader-audio-prepare-failed', {
         error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
       })
@@ -2295,6 +2550,7 @@ function App() {
     rehearsalSessionRef.current = null
     disposeRehearsalSession(session)
     setRehearsalView(null)
+    window.__promptRehearsalRuntime = null
   }
 
   async function toggleTeleprompterFullscreen() {
@@ -2333,6 +2589,7 @@ function App() {
     stopRun()
     stopRehearsal()
     const session = {
+      sessionId: makeId(),
       lines: [...folderPrompts],
       index: 0,
       phase: 'starting',
@@ -2454,9 +2711,9 @@ function App() {
     } else if (session.phase === 'speaking') {
       updateRehearsalView(session, 'speaking')
       session.readerCountdownTimer = window.setInterval(() => updateRehearsalView(session, 'speaking'), 250)
-      session.readerAudio?.audio.play().catch(() => {
-        failRehearsal(session, 'Reader playback could not be resumed. Restart rehearsal to try again.')
-      })
+      resumeReaderPitch(session.readerAudio?.audio)
+        .then(() => session.readerAudio?.audio.play())
+        .catch(() => failRehearsal(session, 'Reader playback could not be resumed. Restart rehearsal to try again.'))
     } else if (session.triggerSatisfied) {
       session.phase = 'speech-end'
       if (session.speechEnded) scheduleMyselfAdvance(session)
@@ -2642,7 +2899,10 @@ function App() {
 
       const objectUrl = URL.createObjectURL(prompt.audio)
       const audio = new Audio(objectUrl)
-      setReaderPlaybackPitch(audio, prompt.speaker, readerPitch)
+      window.__promptAudioRuntime = { mode: 'Run', sessionId: session, promptId: prompt.id, label, speaker: prompt.speaker, phase: 'preparing' }
+      let pitchCleanup = () => {}
+      const selectedPitch = readerPitchRef.current
+      const pitchSetup = prepareReaderPitch(audio, prompt.speaker, selectedPitch)
       setRunStatus({ index: index + 1, total: queue.length, title: label, promptId: prompt.id, silence: false })
       const played = await new Promise((resolve) => {
         let settled = false
@@ -2655,14 +2915,17 @@ function App() {
           window.clearInterval(countdownInterval)
           countdownInterval = null
           trimCleanup()
+          pitchCleanup()
           audio.removeEventListener('ended', onEnded)
           audio.removeEventListener('error', onError)
           resolve(didPlay)
         }
         const onEnded = () => {
+          recordPromptAudioTrace('run-media-ended', { promptId: prompt.id, sessionId: session, speaker: prompt.speaker })
           finish(true)
         }
         const onError = () => {
+          recordPromptAudioTrace('run-media-error', { promptId: prompt.id, sessionId: session, speaker: prompt.speaker, mediaErrorCode: audio.error?.code ?? null })
           finish(false)
         }
         const pausePlayback = () => {
@@ -2670,7 +2933,10 @@ function App() {
         }
         const resumePlayback = () => {
           if (settled || runPausedRef.current || !trimReady) return
-          audio.play().catch(() => finish(false))
+          resumeReaderPitch(audio).then(() => audio.play()).catch((error) => {
+            recordPromptAudioTrace('run-play-rejected', { promptId: prompt.id, sessionId: session, error: error?.message ?? String(error) })
+            finish(false)
+          })
         }
         audio.addEventListener('ended', onEnded)
         audio.addEventListener('error', onError)
@@ -2697,12 +2963,23 @@ function App() {
           pendingRunSkipRef.current = null
           playback.skip()
         }
-        waitForAudioMetadata(audio).then(() => prepareAudioTrim(audio, prompt.audio, prompt.trimSilence, () => {
-          finish(true)
-        })).then(({ cleanup, duration }) => {
+        waitForAudioMetadata(audio).then(async () => {
+          pitchCleanup = await pitchSetup
+          recordPromptAudioTrace('run-pitch-ready', { promptId: prompt.id, sessionId: session, speaker: prompt.speaker, pitch: selectedPitch })
+          window.__promptAudioRuntime = { mode: 'Run', sessionId: session, promptId: prompt.id, label, speaker: prompt.speaker, phase: 'playing' }
+          if (settled) {
+            pitchCleanup()
+            return { cleanup: () => {}, duration: 0 }
+          }
+          return prepareAudioTrim(audio, prompt.audio, prompt.trimSilence, () => finish(true))
+        }).then(({ cleanup, duration }) => {
           if (session !== playbackSessionRef.current) {
             cleanup()
             finish(false)
+            return
+          }
+          if (settled) {
+            cleanup()
             return
           }
           trimCleanup = cleanup
@@ -2722,6 +2999,10 @@ function App() {
             return
           }
           if (!runPausedRef.current) resumePlayback()
+        }).catch((error) => {
+          recordPromptAudioTrace('run-audio-setup-failed', { promptId: prompt.id, sessionId: session, error: error?.message ?? String(error), stack: error?.stack })
+          setRunError(`Audio could not be prepared for "${label}": ${error?.message ?? String(error)}`)
+          finish(false)
         })
       })
 
@@ -2738,6 +3019,7 @@ function App() {
       runPausedRef.current = false
       setIsRunPaused(false)
       setRunStatus(null)
+      window.__promptAudioRuntime = null
     }
   }
 
@@ -2968,7 +3250,7 @@ function App() {
                       'prompt-row',
                       prompt.type === 'silence' && 'prompt-row-silence',
                       prompt.type !== 'silence' && !isUsableRecording(prompt.audio) && 'prompt-row-no-audio',
-                      draggedPromptId === prompt.id && 'is-dragging',
+                      draggedPromptId === prompt.id && 'is-drag-source',
                       dragOverPromptId === prompt.id && draggedPromptId !== prompt.id && 'is-drag-over',
                       dragOverPromptId === prompt.id && draggedPromptId !== prompt.id && `is-drop-${dragDropPosition}`,
                       !canReorderPrompts && 'is-reorder-disabled',
@@ -2979,6 +3261,7 @@ function App() {
                     onPointerMove={movePromptDrag}
                     onPointerUp={finishPromptDrag}
                     onPointerCancel={cancelPromptDrag}
+                    onLostPointerCapture={cancelPromptDrag}
                   >
                     <span
                       className="prompt-drag-handle"
@@ -3008,7 +3291,7 @@ function App() {
                         <span>{silenceDurationSeconds(prompt)}s</span>
                         <button type="button" aria-label="Increase silence duration" disabled={!canReorderPrompts || silenceDurationSeconds(prompt) >= 600} onClick={() => adjustSilenceDuration(prompt, 1)}>+</button>
                       </div>
-                    ) : isUsableRecording(prompt.audio) ? <AudioPlayer audio={prompt.audio} trimSilence={prompt.trimSilence} /> : <span className="prompt-audio-missing"><span aria-hidden="true">{'\u266A'}</span> Audio not added</span>}
+                    ) : isUsableRecording(prompt.audio) ? <AudioPlayer audio={prompt.audio} trimSilence={prompt.trimSilence} speaker={prompt.speaker} pitch={readerPitch} promptId={prompt.id} /> : <span className="prompt-audio-missing"><span aria-hidden="true">{'\u266A'}</span> Audio not added</span>}
                     <div className="prompt-actions">
                       {prompt.type !== 'silence' && <button className="text-action prompt-edit-action" type="button" onClick={() => editPrompt(prompt)}><svg className="prompt-action-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m3 11.8-.7 2.9 2.9-.7L14 5.2 10.8 2 3 9.8v2Z" /><path d="m9.8 3 3.2 3.2" /></svg>Edit</button>}
                       <button className="text-action prompt-delete-action" type="button" onClick={() => deletePrompt(prompt)}><svg className="prompt-action-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 4.5h9M6 4.5V3h4v1.5m1.5 0-.5 9h-6l-.5-9M6.5 7v4m3-4v4" /></svg>Delete</button>
@@ -3137,7 +3420,7 @@ function App() {
               <section className="reader-pitch-control">
                 <div className="reader-pitch-heading">
                   <label htmlFor="reader-pitch">Reader pitch</label>
-                  <output htmlFor="reader-pitch">{readerPitch.toFixed(2)}{'\u00B0'}</output>
+                  <output htmlFor="reader-pitch">{`${12 * Math.log2(readerPitch) > 0 ? '+' : ''}${(12 * Math.log2(readerPitch)).toFixed(1)} st`}</output>
                 </div>
                 <input
                   id="reader-pitch"
@@ -3160,7 +3443,7 @@ function App() {
 
       {isImportingScript && selectedFolder && <ScriptImportDialog folderName={selectedFolder.name} onClose={() => setIsImportingScript(false)} onImport={importScriptPrompts} />}
       {folderDialog && <FolderDialog folder={folderDialog.folder} onClose={() => setFolderDialog(null)} onSave={saveFolder} />}
-      {promptDialog && selectedFolder && <PromptDialog folderName={selectedFolder.name} characters={selectedFolder.characters ?? []} prompt={promptDialog.prompt} onClose={() => setPromptDialog(null)} onSave={savePrompt} onGenerateRecording={generateRecordingForPrompt} />}
+      {promptDialog && selectedFolder && <PromptDialog folderName={selectedFolder.name} characters={selectedFolder.characters ?? []} prompt={promptDialog.prompt} readerPitch={readerPitch} onClose={() => setPromptDialog(null)} onSave={savePrompt} onGenerateRecording={generateRecordingForPrompt} />}
     </main>
   )
 }
