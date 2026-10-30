@@ -1,5 +1,3 @@
-import './pdfRuntimePolyfill.js'
-
 let pdfJsRuntimePromise
 
 export function recordPdfDiagnostic(stage, status, details = {}) {
@@ -55,8 +53,9 @@ export function buildPdfDiagnosticReport(error, failureTrace = null) {
     secureContext: window.isSecureContext ?? null,
     crossOriginIsolated: window.crossOriginIsolated ?? null,
     promiseWithResolvers: typeof Promise.withResolvers,
-    promiseWithResolversPolyfilled: Boolean(globalThis.__actorsPrompterPromiseWithResolversPolyfilled),
     worker: typeof window.Worker,
+    readableStreamGetReader: typeof window.ReadableStream?.prototype?.getReader,
+    readableStreamAsyncIterator: typeof window.ReadableStream?.prototype?.[Symbol.asyncIterator],
     blob: typeof window.Blob,
     fileReader: typeof window.FileReader,
     fileArrayBuffer: typeof window.File?.prototype?.arrayBuffer,
@@ -109,7 +108,7 @@ export function loadPdfJsRuntime() {
         const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs')
         recordPdfDiagnostic(stage, 'ready', { pdfjsVersion: pdfjs.version })
         stage = 'load matching PDF.js worker URL'
-        const worker = await import('./pdfjs.worker.js?worker&url')
+        const worker = await import('pdfjs-dist/legacy/build/pdf.worker.min.mjs?url')
         pdfjs.GlobalWorkerOptions.workerSrc = worker.default
         recordPdfDiagnostic(stage, 'ready', { pdfjsVersion: pdfjs.version, workerUrl: worker.default })
         return pdfjs
@@ -127,6 +126,37 @@ export function loadPdfJsRuntime() {
     })
   }
   return pdfJsRuntimePromise
+}
+
+// Avoid PDF.js getTextContent()'s `for await` over ReadableStream. Some
+// WebKit versions expose ReadableStream but omit its async iterator.
+export async function readPdfPageTextItems(page) {
+  if (typeof page?.streamTextContent !== 'function') {
+    throw new Error('This PDF.js page does not provide a text content stream.')
+  }
+  const stream = page.streamTextContent()
+  if (typeof stream?.getReader !== 'function') {
+    throw new Error('PDF.js did not provide a readable text content stream.')
+  }
+  const reader = stream.getReader()
+  const items = []
+  try {
+    while (true) {
+      const result = await reader.read()
+      if (result.done) break
+      const chunkItems = result.value?.items
+      if (!Array.isArray(chunkItems)) {
+        throw new Error('PDF.js returned a text chunk without an items array.')
+      }
+      items.push(...chunkItems)
+    }
+    return items
+  } catch (error) {
+    try { await reader.cancel(error) } catch { /* Preserve the original extraction error. */ }
+    throw error
+  } finally {
+    try { reader.releaseLock() } catch { /* Some stream implementations release on close. */ }
+  }
 }
 
 export function readBlobAsArrayBuffer(blob) {

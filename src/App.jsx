@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { blocksRecordingGeneration, findPromptInsertion, isRecoverableRecognitionInterruption, movePromptInList } from './promptBehavior.js'
 import PdfFollowViewer from './PdfFollowViewer.jsx'
-import { describePdfError, loadPdfJsRuntime, readBlobAsArrayBuffer, recordPdfDiagnostic, watchPdfWindowErrors } from './pdfFollow.js'
+import { describePdfError, loadPdfJsRuntime, readBlobAsArrayBuffer, readPdfPageTextItems, recordPdfDiagnostic, watchPdfWindowErrors } from './pdfFollow.js'
 import PdfDiagnosticDetails from './PdfDiagnosticDetails.jsx'
 import TtsWorker from './tts.worker.js?worker'
 import './App.css'
@@ -312,7 +312,14 @@ function isCharacterCue(line) {
 async function extractScriptLines(file, onPageProgress = () => {}) {
   const pdfjsLib = await loadPdfJsRuntime()
   recordPdfDiagnostic('script import: read file', 'started', { fileSize: file?.size ?? null })
-  const data = await readBlobAsArrayBuffer(file)
+  let data
+  try {
+    data = await readBlobAsArrayBuffer(file)
+    recordPdfDiagnostic('script import: read file', 'ready', { byteLength: data.byteLength })
+  } catch (error) {
+    recordPdfDiagnostic('script import: read file', 'failed', { error: error instanceof Error ? `${error.name}: ${error.message}` : String(error), stack: error instanceof Error ? error.stack : undefined })
+    throw error
+  }
   recordPdfDiagnostic('script import: parse document', 'started', { byteLength: data.byteLength })
   const loadingTask = pdfjsLib.getDocument({ data })
   let pdf
@@ -329,25 +336,43 @@ async function extractScriptLines(file, onPageProgress = () => {}) {
   onPageProgress({ page: 0, total: pdf.numPages })
   const lines = []
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-    const page = await pdf.getPage(pageNumber)
-    const content = await page.getTextContent()
-    const positionedLines = new Map()
-    for (const item of content.items) {
-      if (!('str' in item) || !item.str.trim()) continue
-      const y = Math.round(item.transform[5] / 2) * 2
-      const row = positionedLines.get(y) ?? []
-      row.push({ x: item.transform[4], text: item.str })
-      positionedLines.set(y, row)
+    let page
+    let stage = `script import: load page ${pageNumber}`
+    recordPdfDiagnostic(stage, 'started', { page: pageNumber })
+    try {
+      page = await pdf.getPage(pageNumber)
+      recordPdfDiagnostic(stage, 'ready', { page: pageNumber })
+      stage = `script import: extract page ${pageNumber} text content`
+      recordPdfDiagnostic(stage, 'started', { page: pageNumber })
+      const items = await readPdfPageTextItems(page)
+      recordPdfDiagnostic(stage, 'ready', { page: pageNumber, textItemCount: items.length })
+      stage = `script import: iterate page ${pageNumber} text items`
+      const positionedLines = new Map()
+      for (const item of items) {
+        if (typeof item?.str !== 'string' || !item.str.trim()) continue
+        if (!Array.isArray(item.transform) || item.transform.length < 6) continue
+        const y = Math.round(item.transform[5] / 2) * 2
+        const row = positionedLines.get(y) ?? []
+        row.push({ x: item.transform[4], text: item.str })
+        positionedLines.set(y, row)
+      }
+      recordPdfDiagnostic(stage, 'ready', { page: pageNumber, textItemCount: items.length })
+      stage = `script import: normalize page ${pageNumber} text`
+      const pageLines = [...positionedLines.entries()]
+        .sort(([yA], [yB]) => yB - yA)
+        .map(([, rowItems]) => rowItems.sort((a, b) => a.x - b.x).map((item) => item.text).join(' ').replace(/\s+/g, ' ').trim())
+      lines.push(...pageLines)
+      recordPdfDiagnostic(stage, 'ready', { page: pageNumber, lineCount: pageLines.length })
+    } catch (error) {
+      recordPdfDiagnostic(stage, 'failed', { page: pageNumber, error: error instanceof Error ? `${error.name}: ${error.message}` : String(error), stack: error instanceof Error ? error.stack : undefined })
+      throw new Error(`Page ${pageNumber} failed during ${stage.replace(/^script import: /, '')}: ${error instanceof Error ? error.message : String(error)}`, { cause: error })
+    } finally {
+      page?.cleanup?.()
     }
-    const pageLines = [...positionedLines.entries()]
-      .sort(([yA], [yB]) => yB - yA)
-      .map(([, items]) => items.sort((a, b) => a.x - b.x).map((item) => item.text).join(' ').replace(/\s+/g, ' ').trim())
-    lines.push(...pageLines)
-    page.cleanup?.()
     onPageProgress({ page: pageNumber, total: pdf.numPages })
   }
-  recordPdfDiagnostic('script import: text extraction', 'ready', { pageCount: pdf.numPages, extractedRows: lines.length })
-
+  recordPdfDiagnostic('script import: assemble dialogue', 'started', { pageCount: pdf.numPages, extractedRows: lines.length })
+  try {
   const dialogue = []
   let activeCharacter = ''
   let activeText = []
@@ -371,7 +396,17 @@ async function extractScriptLines(file, onPageProgress = () => {}) {
   }
   flush()
   if (!dialogue.length) throw new Error('No dialogue was detected. This PDF may be scanned, image-only, or not formatted as a character script.')
+  recordPdfDiagnostic('script import: assemble dialogue', 'ready', { pageCount: pdf.numPages, extractedRows: lines.length, dialogueCount: dialogue.length })
   return { dialogue, pageCount: pdf.numPages }
+  } catch (error) {
+    recordPdfDiagnostic('script import: assemble dialogue', 'failed', {
+      error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      pageCount: pdf.numPages,
+      extractedRows: lines.length,
+    })
+    throw error
+  }
 }
 function getAudioBounds(blob) {
   if (!blob || typeof blob.arrayBuffer !== 'function') return Promise.resolve({ start: 0, end: 0 })

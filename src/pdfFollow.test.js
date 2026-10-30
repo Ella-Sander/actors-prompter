@@ -1,6 +1,29 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { findPdfDialogueMatch, inspectPdfDialogueMatch, normalizePdfMatchText, readBlobAsArrayBuffer } from './pdfFollow.js'
+import { findPdfDialogueMatch, inspectPdfDialogueMatch, normalizePdfMatchText, readBlobAsArrayBuffer, readPdfPageTextItems } from './pdfFollow.js'
+
+test('reads text stream chunks in original order without async iteration', async () => {
+  const first = { str: 'First', transform: [1, 0, 0, 1, 0, 10] }
+  const second = { str: 'second', transform: [1, 0, 0, 1, 0, 8] }
+  const page = { streamTextContent: () => new ReadableStream({
+    start(controller) {
+      controller.enqueue({ items: [first] })
+      controller.enqueue({ items: [second] })
+      controller.close()
+    },
+  }) }
+  assert.deepEqual(await readPdfPageTextItems(page), [first, second])
+})
+
+test('returns no items for an empty PDF text stream', async () => {
+  const page = { streamTextContent: () => new ReadableStream({ start(controller) { controller.close() } }) }
+  assert.deepEqual(await readPdfPageTextItems(page), [])
+})
+
+test('reports malformed text stream chunks instead of silently dropping content', async () => {
+  const page = { streamTextContent: () => new ReadableStream({ start(controller) { controller.enqueue({ text: 'not items' }) } }) }
+  await assert.rejects(readPdfPageTextItems(page), /without an items array/)
+})
 
 function makeIndex(lines) {
   const words = []

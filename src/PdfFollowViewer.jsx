@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { describePdfError, inspectPdfDialogueMatch, loadPdfJsRuntime, normalizePdfMatchText, readBlobAsArrayBuffer, recordPdfDiagnostic, watchPdfWindowErrors } from './pdfFollow.js'
+import { describePdfError, inspectPdfDialogueMatch, loadPdfJsRuntime, normalizePdfMatchText, readBlobAsArrayBuffer, readPdfPageTextItems, recordPdfDiagnostic, watchPdfWindowErrors } from './pdfFollow.js'
 import PdfDiagnosticDetails from './PdfDiagnosticDetails.jsx'
 
 function buildPdfIndex(pageRecords) {
@@ -98,14 +98,20 @@ export default function PdfFollowViewer({ file, fileId, fileName, pdfLibrary = [
       const records = []
       for (let pageNumber = 1; pageNumber <= loadedPdf.numPages; pageNumber += 1) {
         if (cancelled) return
-        stage = `extract PDF text page ${pageNumber}`
+        stage = `load PDF page ${pageNumber}`
         recordPdfDiagnostic(stage, 'started')
         const page = await loadedPdf.getPage(pageNumber)
         const viewport = page.getViewport({ scale: 1 })
-        const content = await page.getTextContent()
-        const items = content.items
+        stage = `extract PDF text content page ${pageNumber}`
+        recordPdfDiagnostic(stage, 'started', { page: pageNumber })
+        const textItems = await readPdfPageTextItems(page)
+        recordPdfDiagnostic(stage, 'ready', { page: pageNumber, textItemCount: textItems.length })
+        stage = `iterate PDF text items page ${pageNumber}`
+        const selectedItems = textItems
           .filter((item) => typeof item.str === 'string' && item.str.trim())
-          .map((item) => ({
+        recordPdfDiagnostic(stage, 'ready', { page: pageNumber, textItemCount: textItems.length, usableItemCount: selectedItems.length })
+        stage = `normalize PDF text page ${pageNumber}`
+        const items = selectedItems.map((item) => ({
             text: item.str,
             x: item.transform[4],
             y: item.transform[5],
