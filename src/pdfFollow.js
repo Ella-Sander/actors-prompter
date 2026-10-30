@@ -1,23 +1,22 @@
+import './pdfRuntimePolyfill.js'
+
 let pdfJsRuntimePromise
 
-function ensurePdfRuntimePolyfills() {
-  // PDF.js uses this promise capability API during document loading. The
-  // legacy build covers most older APIs, but WebKit added this one in Safari 17.4.
-  if (typeof Promise.withResolvers !== 'function') {
-    Object.defineProperty(Promise, 'withResolvers', {
-      configurable: true,
-      writable: true,
-      value() {
-        let resolve
-        let reject
-        const promise = new this((resolvePromise, rejectPromise) => {
-          resolve = resolvePromise
-          reject = rejectPromise
-        })
-        return { promise, resolve, reject }
-      },
-    })
+export function recordPdfDiagnostic(stage, status, details = {}) {
+  if (typeof window === 'undefined') return
+  const entries = window.__pdfInitializationTrace ??= []
+  const entry = {
+    time: new Date().toISOString(),
+    stage,
+    status,
+    userAgent: window.navigator?.userAgent ?? 'unknown',
+    ...details,
   }
+  entries.push(entry)
+  if (entries.length > 30) entries.shift()
+  if (status === 'failed') console.error('[PDF initialization failure]', entry)
+  else console.info('[PDF initialization]', entry)
+  return entry
 }
 
 export function normalizePdfMatchText(value) {
@@ -34,16 +33,28 @@ export function normalizePdfMatchText(value) {
 
 export function loadPdfJsRuntime() {
   if (!pdfJsRuntimePromise) {
-    ensurePdfRuntimePolyfills()
-    pdfJsRuntimePromise = Promise.all([
-      import('pdfjs-dist/legacy/build/pdf.mjs'),
-      import('pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'),
-    ]).then(([pdfjs, worker]) => {
-      pdfjs.GlobalWorkerOptions.workerSrc = worker.default
-      return pdfjs
-    }).catch((error) => {
+    let stage = 'load legacy PDF.js API'
+    recordPdfDiagnostic('runtime', 'started', { promiseWithResolvers: typeof Promise.withResolvers })
+    pdfJsRuntimePromise = (async () => {
+      try {
+        const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs')
+        recordPdfDiagnostic(stage, 'ready', { pdfjsVersion: pdfjs.version })
+        stage = 'load matching PDF.js worker URL'
+        const worker = await import('./pdfjs.worker.js?worker&url')
+        pdfjs.GlobalWorkerOptions.workerSrc = worker.default
+        recordPdfDiagnostic(stage, 'ready', { pdfjsVersion: pdfjs.version, workerUrl: worker.default })
+        return pdfjs
+      } catch (error) {
+        recordPdfDiagnostic(stage, 'failed', {
+          error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+        })
+        pdfJsRuntimePromise = undefined
+        throw error
+      }
+    })()
+    pdfJsRuntimePromise.catch(() => {
       pdfJsRuntimePromise = undefined
-      throw error
     })
   }
   return pdfJsRuntimePromise

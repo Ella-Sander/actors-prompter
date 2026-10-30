@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { describePdfError, inspectPdfDialogueMatch, loadPdfJsRuntime, normalizePdfMatchText, readBlobAsArrayBuffer } from './pdfFollow.js'
+import { describePdfError, inspectPdfDialogueMatch, loadPdfJsRuntime, normalizePdfMatchText, readBlobAsArrayBuffer, recordPdfDiagnostic } from './pdfFollow.js'
 
 function buildPdfIndex(pageRecords) {
   const words = []
@@ -46,6 +46,7 @@ export default function PdfFollowViewer({ file, fileId, fileName, pdfLibrary = [
   const [pdf, setPdf] = useState(null)
   const [pageRecords, setPageRecords] = useState([])
   const [loadError, setLoadError] = useState('')
+  const [loadErrorTrace, setLoadErrorTrace] = useState(null)
   const [status, setStatus] = useState('Loading PDF…')
   const [viewerWidth, setViewerWidth] = useState(800)
   const [renderVersion, setRenderVersion] = useState(0)
@@ -68,22 +69,30 @@ export default function PdfFollowViewer({ file, fileId, fileName, pdfLibrary = [
     let cancelled = false
     let loadedPdf
     let loadingTask
+    let stage = 'initialize PDF.js runtime'
     setPdf(null)
     setPageRecords([])
     setLoadError('')
+    setLoadErrorTrace(null)
     setAnchor(null)
     setMatchTrace(null)
     anchorRef.current = null
     lastPromptRef.current = { id: null, index: null }
     setStatus('Loading PDF…')
     loadPdfJsRuntime().then(async (pdfjs) => {
+      stage = 'read PDF file bytes'
+      recordPdfDiagnostic(stage, 'started', { fileSize: file?.size ?? null })
       const data = await readBlobAsArrayBuffer(file)
       if (cancelled) return
+      stage = 'parse PDF document'
+      recordPdfDiagnostic(stage, 'started', { byteLength: data.byteLength })
       loadingTask = pdfjs.getDocument({ data })
       loadedPdf = await loadingTask.promise
+      recordPdfDiagnostic(stage, 'ready', { pageCount: loadedPdf.numPages })
       const records = []
       for (let pageNumber = 1; pageNumber <= loadedPdf.numPages; pageNumber += 1) {
         if (cancelled) return
+        stage = `extract PDF text page ${pageNumber}`
         const page = await loadedPdf.getPage(pageNumber)
         const viewport = page.getViewport({ scale: 1 })
         const content = await page.getTextContent()
@@ -101,11 +110,19 @@ export default function PdfFollowViewer({ file, fileId, fileName, pdfLibrary = [
       if (cancelled) return
       setPdf(loadedPdf)
       setPageRecords(records)
+      recordPdfDiagnostic('extract PDF text', 'ready', {
+        pageCount: records.length,
+        selectableTextPages: records.filter((page) => page.items.length > 0).length,
+      })
       setStatus(records.some((page) => page.items.length) ? '' : 'This PDF has no selectable text. Scroll manually; automatic follow is unavailable.')
     }).catch((error) => {
       if (!cancelled) {
-        console.error('[PDF loading failure]', error)
-        setLoadError(describePdfError(error))
+        const trace = recordPdfDiagnostic(stage, 'failed', {
+          error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+        })
+        setLoadErrorTrace(trace)
+        setLoadError(`${stage}: ${describePdfError(error)}`)
         setStatus('')
       }
     })
@@ -182,7 +199,11 @@ export default function PdfFollowViewer({ file, fileId, fileName, pdfLibrary = [
           if (!cancelled && visiblePages.has(record.page)) renderedCanvases.add(record.page)
         } catch (error) {
           if (error?.name !== 'RenderingCancelledException' && !cancelled) {
-            console.error(`[PDF page ${record.page} render failure]`, error)
+            const trace = recordPdfDiagnostic(`render PDF page ${record.page}`, 'failed', {
+              error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+              stack: error instanceof Error ? error.stack : undefined,
+            })
+            setLoadErrorTrace(trace)
             setLoadError(`Page ${record.page}: ${describePdfError(error)}`)
           }
         } finally {
@@ -401,7 +422,13 @@ export default function PdfFollowViewer({ file, fileId, fileName, pdfLibrary = [
           </ol>
         </div>
       </details>}
-      {loadError && <p className="pdf-follow-error" role="alert">{loadError}</p>}
+      {loadError && <div className="pdf-follow-error" role="alert">
+        <p>{loadError}</p>
+        {loadErrorTrace && <details>
+          <summary>Technical details</summary>
+          <pre>{[loadErrorTrace.error, loadErrorTrace.stack, `Browser: ${loadErrorTrace.userAgent}`].filter(Boolean).join('\n')}</pre>
+        </details>}
+      </div>}
       <div className="pdf-follow-pages" ref={scrollRef}>
         {!file && <div className="pdf-follow-empty"><span aria-hidden="true">▤</span><strong>Choose audition sides</strong><p>Select a PDF above or add one from your device.</p><label className="quiet-button pdf-select-button">Add PDF from device<input type="file" accept="application/pdf,.pdf" onChange={(event) => { const selected = event.target.files?.[0]; if (selected) onPdfSelected?.(selected); event.target.value = '' }} /></label><p className="pdf-library-hint">Manage your saved PDFs from the home screen.</p></div>}
         {file && !pageRecords.length && !loadError && <div className="pdf-follow-loading">Loading script pages…</div>}

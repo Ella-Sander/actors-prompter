@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { blocksRecordingGeneration, findPromptInsertion, isRecoverableRecognitionInterruption, movePromptInList } from './promptBehavior.js'
 import PdfFollowViewer from './PdfFollowViewer.jsx'
-import { describePdfError, loadPdfJsRuntime, readBlobAsArrayBuffer } from './pdfFollow.js'
+import { describePdfError, loadPdfJsRuntime, readBlobAsArrayBuffer, recordPdfDiagnostic } from './pdfFollow.js'
 import TtsWorker from './tts.worker.js?worker'
 import './App.css'
 
@@ -310,7 +310,21 @@ function isCharacterCue(line) {
 
 async function extractScriptLines(file, onPageProgress = () => {}) {
   const pdfjsLib = await loadPdfJsRuntime()
-  const pdf = await pdfjsLib.getDocument({ data: await readBlobAsArrayBuffer(file) }).promise
+  recordPdfDiagnostic('script import: read file', 'started', { fileSize: file?.size ?? null })
+  const data = await readBlobAsArrayBuffer(file)
+  recordPdfDiagnostic('script import: parse document', 'started', { byteLength: data.byteLength })
+  const loadingTask = pdfjsLib.getDocument({ data })
+  let pdf
+  try {
+    pdf = await loadingTask.promise
+  } catch (error) {
+    recordPdfDiagnostic('script import: parse document', 'failed', {
+      error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    })
+    throw error
+  }
+  recordPdfDiagnostic('script import: document ready', 'ready', { pageCount: pdf.numPages })
   onPageProgress({ page: 0, total: pdf.numPages })
   const lines = []
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
@@ -331,6 +345,7 @@ async function extractScriptLines(file, onPageProgress = () => {}) {
     page.cleanup?.()
     onPageProgress({ page: pageNumber, total: pdf.numPages })
   }
+  recordPdfDiagnostic('script import: text extraction', 'ready', { pageCount: pdf.numPages, extractedRows: lines.length })
 
   const dialogue = []
   let activeCharacter = ''
@@ -1050,6 +1065,10 @@ function ScriptImportDialog({ folderName, pdfLibrary, onClose, onImport }) {
       setCharacters(detected)
       setSelectedCharacter(detected[0] ?? '')
     } catch (extractError) {
+      recordPdfDiagnostic('script import', 'failed', {
+        error: extractError instanceof Error ? `${extractError.name}: ${extractError.message}` : String(extractError),
+        stack: extractError instanceof Error ? extractError.stack : undefined,
+      })
       setError(describePdfError(extractError))
     } finally {
       setLoading(false)
