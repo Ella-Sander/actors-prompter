@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { inspectPdfDialogueMatch, normalizePdfMatchText, readBlobAsArrayBuffer } from './pdfFollow.js'
+import { describePdfError, inspectPdfDialogueMatch, loadPdfJsRuntime, normalizePdfMatchText, readBlobAsArrayBuffer } from './pdfFollow.js'
 
 function buildPdfIndex(pageRecords) {
   const words = []
@@ -51,6 +51,7 @@ export default function PdfFollowViewer({ file, fileId, fileName, pdfLibrary = [
   const [renderVersion, setRenderVersion] = useState(0)
   const [anchor, setAnchor] = useState(null)
   const [centerPrompt, setCenterPrompt] = useState(false)
+  const [pdfDragActive, setPdfDragActive] = useState(false)
   const [matchTrace, setMatchTrace] = useState(null)
   const anchorRef = useRef(null)
   const lastPromptRef = useRef({ id: null, index: null })
@@ -75,10 +76,10 @@ export default function PdfFollowViewer({ file, fileId, fileName, pdfLibrary = [
     anchorRef.current = null
     lastPromptRef.current = { id: null, index: null }
     setStatus('Loading PDF…')
-    import('pdfjs-dist').then(async (pdfjs) => {
-      const worker = await import('pdfjs-dist/build/pdf.worker.min.mjs?url')
-      pdfjs.GlobalWorkerOptions.workerSrc = worker.default
-      loadingTask = pdfjs.getDocument({ data: await readBlobAsArrayBuffer(file) })
+    loadPdfJsRuntime().then(async (pdfjs) => {
+      const data = await readBlobAsArrayBuffer(file)
+      if (cancelled) return
+      loadingTask = pdfjs.getDocument({ data })
       loadedPdf = await loadingTask.promise
       const records = []
       for (let pageNumber = 1; pageNumber <= loadedPdf.numPages; pageNumber += 1) {
@@ -94,7 +95,8 @@ export default function PdfFollowViewer({ file, fileId, fileName, pdfLibrary = [
             y: item.transform[5],
             fontHeight: item.height ?? Math.hypot(item.transform[2], item.transform[3]),
           }))
-        records.push({ page: pageNumber, width: viewport.width, height: viewport.height, items, proxy: page })
+        records.push({ page: pageNumber, width: viewport.width, height: viewport.height, items })
+        page.cleanup?.()
       }
       if (cancelled) return
       setPdf(loadedPdf)
@@ -102,7 +104,8 @@ export default function PdfFollowViewer({ file, fileId, fileName, pdfLibrary = [
       setStatus(records.some((page) => page.items.length) ? '' : 'This PDF has no selectable text. Scroll manually; automatic follow is unavailable.')
     }).catch((error) => {
       if (!cancelled) {
-        setLoadError(error?.message || 'This PDF could not be opened.')
+        console.error('[PDF loading failure]', error)
+        setLoadError(describePdfError(error))
         setStatus('')
       }
     })
@@ -146,29 +149,85 @@ export default function PdfFollowViewer({ file, fileId, fileName, pdfLibrary = [
   useEffect(() => {
     if (!pdf || !pageRecords.length || !viewerWidth) return undefined
     let cancelled = false
-    const tasks = []
+    const tasks = new Map()
+    const renderingPages = new Set()
+    const renderedCanvases = new Set()
+    const visiblePages = new Set()
+    const mobileViewport = window.matchMedia?.('(max-width: 700px)').matches ?? false
+    const maxCanvasPixels = mobileViewport ? 1_500_000 : 4_000_000
     const renderPages = async () => {
-      for (const record of pageRecords) {
+      const renderPage = async (record) => {
         if (cancelled) return
         const canvas = canvasRefs.current[record.page - 1]
-        if (!canvas) continue
-        const scale = viewerWidth / record.width
-        const viewport = record.proxy.getViewport({ scale })
-        const outputScale = Math.min(window.devicePixelRatio || 1, 2)
-        canvas.width = Math.floor(viewport.width * outputScale)
-        canvas.height = Math.floor(viewport.height * outputScale)
+        if (!canvas || tasks.has(record.page) || renderingPages.has(record.page)) return
+        renderingPages.add(record.page)
+        const displayWidth = Math.min(viewerWidth, 800)
+        const scale = displayWidth / record.width
+        const viewport = { width: record.width * scale, height: record.height * scale }
+        const outputScale = Math.min(window.devicePixelRatio || 1, mobileViewport ? 1.5 : 2, Math.sqrt(maxCanvasPixels / Math.max(1, viewport.width * viewport.height)))
+        canvas.width = Math.max(1, Math.floor(viewport.width * outputScale))
+        canvas.height = Math.max(1, Math.floor(viewport.height * outputScale))
         canvas.style.width = `${viewport.width}px`
         canvas.style.height = `${viewport.height}px`
-        const context = canvas.getContext('2d', { alpha: false })
-        const task = record.proxy.render({ canvasContext: context, viewport, transform: outputScale === 1 ? null : [outputScale, 0, 0, outputScale, 0, 0] })
-        tasks.push(task)
-        try { await task.promise } catch (error) { if (error?.name !== 'RenderingCancelledException' && !cancelled) setLoadError(error?.message || 'A PDF page could not be rendered.') }
+        let page
+        try {
+          page = await pdf.getPage(record.page)
+          if (cancelled || !visiblePages.has(record.page)) return
+          const pageViewport = page.getViewport({ scale })
+          const context = canvas.getContext('2d', { alpha: false })
+          if (!context) throw new Error('This browser could not allocate a canvas for a PDF page. Try a smaller PDF or close other tabs.')
+          const task = page.render({ canvasContext: context, viewport: pageViewport, transform: outputScale === 1 ? null : [outputScale, 0, 0, outputScale, 0, 0] })
+          tasks.set(record.page, task)
+          await task.promise
+          if (!cancelled && visiblePages.has(record.page)) renderedCanvases.add(record.page)
+        } catch (error) {
+          if (error?.name !== 'RenderingCancelledException' && !cancelled) {
+            console.error(`[PDF page ${record.page} render failure]`, error)
+            setLoadError(`Page ${record.page}: ${describePdfError(error)}`)
+          }
+        } finally {
+          page?.cleanup?.()
+          renderingPages.delete(record.page)
+          tasks.delete(record.page)
+        }
+      }
+      const clearPage = (record) => {
+        visiblePages.delete(record.page)
+        tasks.get(record.page)?.cancel()
+        renderedCanvases.delete(record.page)
+        const canvas = canvasRefs.current[record.page - 1]
+        if (canvas) {
+          canvas.width = 0
+          canvas.height = 0
+        }
+      }
+      const observer = typeof IntersectionObserver === 'function'
+        ? new IntersectionObserver((entries) => {
+          for (const entry of entries) {
+            const record = pageRecords[Number(entry.target.dataset.pageIndex)]
+            if (!record) continue
+            if (entry.isIntersecting) {
+              visiblePages.add(record.page)
+              renderPage(record)
+            }
+            else clearPage(record)
+          }
+        }, { root: scrollRef.current, rootMargin: '120% 0px' })
+        : null
+      if (observer && scrollRef.current) {
+        pageRefs.current.forEach((element) => element && observer.observe(element))
+      } else {
+        for (const record of pageRecords) visiblePages.add(record.page)
+        for (const record of pageRecords) await renderPage(record)
       }
       if (!cancelled) setRenderVersion((current) => current + 1)
+      return observer
     }
-    renderPages()
+    let observer
+    renderPages().then((value) => { observer = value })
     return () => {
       cancelled = true
+      observer?.disconnect()
       tasks.forEach((task) => task.cancel())
     }
   }, [pdf, pageRecords, viewerWidth])
@@ -274,7 +333,34 @@ export default function PdfFollowViewer({ file, fileId, fileName, pdfLibrary = [
   }
 
   return (
-    <section className="pdf-follow-view" aria-label="PDF Run With Me viewer">
+    <section
+      className={`pdf-follow-view${pdfDragActive ? ' is-pdf-dragging' : ''}`}
+      aria-label="PDF Run With Me viewer"
+      onDragOver={(event) => {
+        if (event.dataTransfer?.files?.length) {
+          event.preventDefault()
+          setPdfDragActive(true)
+        }
+      }}
+      onDragLeave={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) setPdfDragActive(false)
+      }}
+      onDrop={(event) => {
+        event.preventDefault()
+        setPdfDragActive(false)
+        const files = event.dataTransfer?.files
+        let dropped = null
+        for (let index = 0; files && index < files.length; index += 1) {
+          const candidate = files[index]
+          if (candidate.type === 'application/pdf' || candidate.name.toLowerCase().endsWith('.pdf')) {
+            dropped = candidate
+            break
+          }
+        }
+        if (dropped) onPdfSelected?.(dropped)
+        else setLoadError('Drop a PDF file to load audition sides.')
+      }}
+    >
       <div className="pdf-follow-toolbar">
         <div className="pdf-follow-toolbar-copy">
           <strong>{fileName || 'Audition sides'}</strong>
@@ -320,7 +406,7 @@ export default function PdfFollowViewer({ file, fileId, fileName, pdfLibrary = [
         {!file && <div className="pdf-follow-empty"><span aria-hidden="true">▤</span><strong>Choose audition sides</strong><p>Select a PDF above or add one from your device.</p><label className="quiet-button pdf-select-button">Add PDF from device<input type="file" accept="application/pdf,.pdf" onChange={(event) => { const selected = event.target.files?.[0]; if (selected) onPdfSelected?.(selected); event.target.value = '' }} /></label><p className="pdf-library-hint">Manage your saved PDFs from the home screen.</p></div>}
         {file && !pageRecords.length && !loadError && <div className="pdf-follow-loading">Loading script pages…</div>}
         {pageRecords.map((page, index) => (
-          <div className="pdf-follow-page" key={`${page.page}-${fileName}`} ref={(element) => { pageRefs.current[index] = element }}>
+          <div className="pdf-follow-page" key={`${page.page}-${fileName}`} data-page-index={index} style={{ width: `${Math.min(viewerWidth, 800)}px`, height: `${Math.min(viewerWidth, 800) * page.height / page.width}px` }} ref={(element) => { pageRefs.current[index] = element }}>
             <canvas ref={(element) => { canvasRefs.current[index] = element }} aria-label={`Script page ${page.page}`} />
             <span className="pdf-follow-page-number">{page.page}</span>
           </div>

@@ -1,3 +1,25 @@
+let pdfJsRuntimePromise
+
+function ensurePdfRuntimePolyfills() {
+  // PDF.js uses this promise capability API during document loading. The
+  // legacy build covers most older APIs, but WebKit added this one in Safari 17.4.
+  if (typeof Promise.withResolvers !== 'function') {
+    Object.defineProperty(Promise, 'withResolvers', {
+      configurable: true,
+      writable: true,
+      value() {
+        let resolve
+        let reject
+        const promise = new this((resolvePromise, rejectPromise) => {
+          resolve = resolvePromise
+          reject = rejectPromise
+        })
+        return { promise, resolve, reject }
+      },
+    })
+  }
+}
+
 export function normalizePdfMatchText(value) {
   return String(value ?? '')
     .normalize('NFKD')
@@ -10,6 +32,23 @@ export function normalizePdfMatchText(value) {
     .filter(Boolean)
 }
 
+export function loadPdfJsRuntime() {
+  if (!pdfJsRuntimePromise) {
+    ensurePdfRuntimePolyfills()
+    pdfJsRuntimePromise = Promise.all([
+      import('pdfjs-dist/legacy/build/pdf.mjs'),
+      import('pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'),
+    ]).then(([pdfjs, worker]) => {
+      pdfjs.GlobalWorkerOptions.workerSrc = worker.default
+      return pdfjs
+    }).catch((error) => {
+      pdfJsRuntimePromise = undefined
+      throw error
+    })
+  }
+  return pdfJsRuntimePromise
+}
+
 export function readBlobAsArrayBuffer(blob) {
   if (typeof blob?.arrayBuffer === 'function') return blob.arrayBuffer()
   if (typeof FileReader !== 'function') return Promise.reject(new Error('This browser cannot read the selected file.'))
@@ -19,6 +58,17 @@ export function readBlobAsArrayBuffer(blob) {
     reader.onerror = () => reject(reader.error ?? new Error('The selected file could not be read.'))
     reader.readAsArrayBuffer(blob)
   })
+}
+
+export function describePdfError(error) {
+  const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error ?? '')
+  if (/not a function|undefined is not|is not iterable/i.test(detail)) {
+    return `PDF support could not initialize in this browser. Reload the app and make sure iOS is up to date. Details: ${detail}`
+  }
+  if (/worker/i.test(detail)) {
+    return `The PDF rendering worker could not start. Reload the app and try again. Details: ${detail}`
+  }
+  return detail || 'This PDF could not be opened. Try exporting it again as a standard PDF.'
 }
 
 function editSimilarity(first, second) {

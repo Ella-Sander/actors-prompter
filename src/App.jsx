@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { blocksRecordingGeneration, findPromptInsertion, isRecoverableRecognitionInterruption, movePromptInList } from './promptBehavior.js'
 import PdfFollowViewer from './PdfFollowViewer.jsx'
-import { readBlobAsArrayBuffer } from './pdfFollow.js'
+import { describePdfError, loadPdfJsRuntime, readBlobAsArrayBuffer } from './pdfFollow.js'
 import TtsWorker from './tts.worker.js?worker'
 import './App.css'
 
@@ -309,11 +309,7 @@ function isCharacterCue(line) {
 }
 
 async function extractScriptLines(file, onPageProgress = () => {}) {
-  const [pdfjsLib, pdfWorker] = await Promise.all([
-    import('pdfjs-dist'),
-    import('pdfjs-dist/build/pdf.worker.min.mjs?url'),
-  ])
-  pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker.default
+  const pdfjsLib = await loadPdfJsRuntime()
   const pdf = await pdfjsLib.getDocument({ data: await readBlobAsArrayBuffer(file) }).promise
   onPageProgress({ page: 0, total: pdf.numPages })
   const lines = []
@@ -332,6 +328,7 @@ async function extractScriptLines(file, onPageProgress = () => {}) {
       .sort(([yA], [yB]) => yB - yA)
       .map(([, items]) => items.sort((a, b) => a.x - b.x).map((item) => item.text).join(' ').replace(/\s+/g, ' ').trim())
     lines.push(...pageLines)
+    page.cleanup?.()
     onPageProgress({ page: pageNumber, total: pdf.numPages })
   }
 
@@ -372,7 +369,9 @@ function getAudioBounds(blob) {
       context = new AudioContextConstructor()
       const decoded = await context.decodeAudioData(await blob.arrayBuffer())
       const duration = decoded.duration
-      const samplesPerWindow = Math.max(1, Math.floor(decoded.sampleRate * 0.01))
+      // Five-millisecond windows give the start detector enough resolution to
+      // place the cut close to the first word without treating a brief click as speech.
+      const samplesPerWindow = Math.max(1, Math.floor(decoded.sampleRate * 0.005))
       const windowCount = Math.ceil(decoded.length / samplesPerWindow)
       const levels = new Float32Array(windowCount)
       for (let channel = 0; channel < decoded.numberOfChannels; channel += 1) {
@@ -387,26 +386,35 @@ function getAudioBounds(blob) {
         }
       }
 
-      const threshold = 0.012
-      const activeWindows = 6
+      const sortedLevels = [...levels].sort((first, second) => first - second)
+      const noiseFloor = sortedLevels[Math.floor((sortedLevels.length - 1) * 0.2)] ?? 0
+      const endThreshold = 0.012
+      const startThreshold = Math.max(0.0035, noiseFloor * 2)
+      const activeWindows = Math.max(1, Math.ceil(0.06 * decoded.sampleRate / samplesPerWindow))
       const findSpeechStart = () => {
-        for (let index = 0; index <= windowCount - activeWindows; index += 1) {
-          if (levels.subarray(index, index + activeWindows).every((level) => level >= threshold)) return index
+        // Require 20 ms of continuous activity. A tap/click at record start is
+        // usually only a few milliseconds, while the first spoken sound sustains.
+        const sustainedOnsetWindows = Math.max(1, Math.ceil(0.02 * decoded.sampleRate / samplesPerWindow))
+        let sustainedCount = 0
+        for (let index = 0; index < windowCount; index += 1) {
+          sustainedCount = levels[index] >= startThreshold ? sustainedCount + 1 : 0
+          if (sustainedCount >= sustainedOnsetWindows) return index - sustainedOnsetWindows + 1
         }
         return -1
       }
       const findSpeechEnd = () => {
         for (let index = windowCount - activeWindows; index >= 0; index -= 1) {
-          if (levels.subarray(index, index + activeWindows).every((level) => level >= threshold)) return index + activeWindows
+          if (levels.subarray(index, index + activeWindows).every((level) => level >= endThreshold)) return index + activeWindows
         }
         return -1
       }
       const firstActive = findSpeechStart()
       const lastActive = findSpeechEnd()
       if (firstActive < 0 || lastActive < 0) return { start: 0, end: duration }
-      const padding = 0.08
-      const start = Math.max(0, firstActive * samplesPerWindow / decoded.sampleRate - padding)
-      const end = Math.min(duration, lastActive * samplesPerWindow / decoded.sampleRate + padding)
+      const startPadding = 0.005
+      const endPadding = 0.08
+      const start = Math.max(0, firstActive * samplesPerWindow / decoded.sampleRate - startPadding)
+      const end = Math.min(duration, lastActive * samplesPerWindow / decoded.sampleRate + endPadding)
       return end > start ? { start, end } : { start: 0, end: duration }
     } catch {
       return { start: 0, end: 0 }
@@ -433,17 +441,46 @@ function waitForAudioMetadata(audio) {
   })
 }
 
+function seekAudioTo(audio, time) {
+  if (!Number.isFinite(time) || Math.abs(audio.currentTime - time) <= 0.025) return Promise.resolve()
+  return new Promise((resolve) => {
+    let timeout
+    const finish = () => {
+      window.clearTimeout(timeout)
+      audio.removeEventListener('seeked', finish)
+      audio.removeEventListener('error', finish)
+      resolve()
+    }
+    audio.addEventListener('seeked', finish, { once: true })
+    audio.addEventListener('error', finish, { once: true })
+    timeout = window.setTimeout(finish, 1500)
+    try {
+      audio.currentTime = time
+      if (Math.abs(audio.currentTime - time) <= 0.025) finish()
+    } catch {
+      finish()
+    }
+  })
+}
+
 async function prepareAudioTrim(audio, blob, shouldTrim, onTrimEnd) {
   if (!shouldTrim) return { cleanup: () => {}, duration: audio.duration }
   const [bounds] = await Promise.all([getAudioBounds(blob), waitForAudioMetadata(audio)])
   const start = Math.max(0, bounds.start)
   const end = Math.min(Number.isFinite(audio.duration) ? audio.duration : bounds.end, bounds.end || audio.duration)
-  if (audio.readyState >= 1) audio.currentTime = start
+  if (audio.readyState >= 1) await seekAudioTo(audio, start)
   if (end <= start) return { cleanup: () => {}, duration: audio.duration }
 
   let finished = false
+  let correctingStart = false
   const handleTimeUpdate = () => {
-    if (finished || audio.currentTime < end - 0.025) return
+    if (finished) return
+    if (audio.currentTime < start - 0.025 && !correctingStart) {
+      correctingStart = true
+      seekAudioTo(audio, start).finally(() => { correctingStart = false })
+      return
+    }
+    if (audio.currentTime < end - 0.025) return
     finished = true
     audio.pause()
     audio.currentTime = end
@@ -899,7 +936,7 @@ function AudioPlayer({ audio, trimSilence = false, speaker = 'Myself', pitch = 1
           const detectedBounds = await boundsPromise
           if (disposed) return
           bounds = { start: detectedBounds.start, end: detectedBounds.end || player.duration }
-          if (player.currentTime < bounds.start || player.currentTime >= bounds.end) player.currentTime = bounds.start
+          if (player.currentTime < bounds.start || player.currentTime >= bounds.end) await seekAudioTo(player, bounds.start)
         }
         player.play().catch((error) => {
           recordPromptAudioTrace('play-rejected', { ...traceDetails, error: error?.message ?? String(error) })
@@ -914,7 +951,7 @@ function AudioPlayer({ audio, trimSilence = false, speaker = 'Myself', pitch = 1
           const detectedBounds = await boundsPromise
           if (disposed) return
           bounds = { start: detectedBounds.start, end: detectedBounds.end || player.duration }
-          if (player.currentTime < bounds.start || player.currentTime >= bounds.end) player.currentTime = bounds.start
+          if (player.currentTime < bounds.start || player.currentTime >= bounds.end) await seekAudioTo(player, bounds.start)
           trimPreparing = false
           player.play().catch((error) => {
             recordPromptAudioTrace('play-rejected', { ...traceDetails, error: error?.message ?? String(error) })
@@ -990,6 +1027,7 @@ function ScriptImportDialog({ folderName, pdfLibrary, onClose, onImport }) {
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const [pageProgress, setPageProgress] = useState(null)
+  const [pdfDragActive, setPdfDragActive] = useState(false)
 
   async function loadPdf(file, name = file?.name, libraryPdfId = '') {
     if (!file) return
@@ -1012,7 +1050,7 @@ function ScriptImportDialog({ folderName, pdfLibrary, onClose, onImport }) {
       setCharacters(detected)
       setSelectedCharacter(detected[0] ?? '')
     } catch (extractError) {
-      setError(extractError?.message || 'This PDF could not be read. Try a text-based PDF instead of a scanned image.')
+      setError(describePdfError(extractError))
     } finally {
       setLoading(false)
     }
@@ -1058,7 +1096,36 @@ function ScriptImportDialog({ folderName, pdfLibrary, onClose, onImport }) {
 
   return (
     <div className="dialog-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !loading && onClose()}>
-      <section className="record-dialog script-import-dialog" role="dialog" aria-modal="true" aria-labelledby="script-import-title">
+      <section
+        className={`record-dialog script-import-dialog${pdfDragActive ? ' is-pdf-dragging' : ''}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="script-import-title"
+        onDragOver={(event) => {
+          if (event.dataTransfer?.files?.length) {
+            event.preventDefault()
+            setPdfDragActive(true)
+          }
+        }}
+        onDragLeave={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget)) setPdfDragActive(false)
+        }}
+        onDrop={(event) => {
+          event.preventDefault()
+          setPdfDragActive(false)
+          const files = event.dataTransfer?.files
+          let dropped = null
+          for (let index = 0; files && index < files.length; index += 1) {
+            const candidate = files[index]
+            if (candidate.type === 'application/pdf' || candidate.name.toLowerCase().endsWith('.pdf')) {
+              dropped = candidate
+              break
+            }
+          }
+          if (dropped) loadPdf(dropped)
+          else setError('Drop a PDF file to import dialogue.')
+        }}
+      >
         <div className="dialog-heading">
           <div>
             <p className="eyebrow">SCRIPT IMPORT <span>///</span> {folderName}</p>
