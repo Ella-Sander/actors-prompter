@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { blocksRecordingGeneration, findPromptInsertion, isRecoverableRecognitionInterruption, movePromptInList } from './promptBehavior.js'
 import PdfFollowViewer from './PdfFollowViewer.jsx'
-import { describePdfError, loadPdfJsRuntime, readBlobAsArrayBuffer, recordPdfDiagnostic } from './pdfFollow.js'
+import { describePdfError, loadPdfJsRuntime, readBlobAsArrayBuffer, recordPdfDiagnostic, watchPdfWindowErrors } from './pdfFollow.js'
+import PdfDiagnosticDetails from './PdfDiagnosticDetails.jsx'
 import TtsWorker from './tts.worker.js?worker'
 import './App.css'
 
@@ -1043,6 +1044,15 @@ function ScriptImportDialog({ folderName, pdfLibrary, onClose, onImport }) {
   const [loading, setLoading] = useState(false)
   const [pageProgress, setPageProgress] = useState(null)
   const [pdfDragActive, setPdfDragActive] = useState(false)
+  const [pdfErrorTrace, setPdfErrorTrace] = useState(null)
+
+  useEffect(() => {
+    if (!loading) return undefined
+    return watchPdfWindowErrors('PDF script import', (trace) => {
+      setPdfErrorTrace(trace)
+      setError(`${trace.stage}: ${describePdfError({ name: 'Error', message: trace.error })}`)
+    })
+  }, [loading])
 
   async function loadPdf(file, name = file?.name, libraryPdfId = '') {
     if (!file) return
@@ -1052,6 +1062,7 @@ function ScriptImportDialog({ folderName, pdfLibrary, onClose, onImport }) {
     setLines([])
     setCharacters([])
     setError('')
+    setPdfErrorTrace(null)
     setPageProgress(null)
     if (!file.type?.includes('pdf') && !name.toLowerCase().endsWith('.pdf')) {
       setError('Choose a PDF file to import.')
@@ -1065,10 +1076,11 @@ function ScriptImportDialog({ folderName, pdfLibrary, onClose, onImport }) {
       setCharacters(detected)
       setSelectedCharacter(detected[0] ?? '')
     } catch (extractError) {
-      recordPdfDiagnostic('script import', 'failed', {
+      const trace = recordPdfDiagnostic('script import', 'failed', {
         error: extractError instanceof Error ? `${extractError.name}: ${extractError.message}` : String(extractError),
         stack: extractError instanceof Error ? extractError.stack : undefined,
       })
+      setPdfErrorTrace(trace)
       setError(describePdfError(extractError))
     } finally {
       setLoading(false)
@@ -1182,6 +1194,7 @@ function ScriptImportDialog({ folderName, pdfLibrary, onClose, onImport }) {
           {lines.length === 0 && <p className="script-import-hint">All dialogue rows have been removed.</p>}
         </>}
         {error && <p className="form-error" role="alert">{error}</p>}
+        {pdfErrorTrace && <PdfDiagnosticDetails error={error} failureTrace={pdfErrorTrace} />}
         <div className="dialog-actions">
           <button className="quiet-button" type="button" onClick={onClose} disabled={loading}>Cancel</button>
           {lines.length > 0 && <button className="primary-button" type="button" onClick={confirmImport} disabled={loading}>{loading ? 'Saving prompts…' : 'Done — import prompts'}</button>}

@@ -19,6 +19,75 @@ export function recordPdfDiagnostic(stage, status, details = {}) {
   return entry
 }
 
+export function watchPdfWindowErrors(context, onError = () => {}) {
+  if (typeof window === 'undefined') return () => {}
+  const handleError = (event) => {
+    const entry = recordPdfDiagnostic(`${context}: window error`, 'failed', {
+      error: event.message || event.error?.message || 'Unspecified browser error',
+      filename: event.filename || null,
+      line: event.lineno || null,
+      column: event.colno || null,
+      stack: event.error?.stack,
+    })
+    onError(entry)
+  }
+  const handleRejection = (event) => {
+    const reason = event.reason
+    const entry = recordPdfDiagnostic(`${context}: unhandled promise rejection`, 'failed', {
+      error: reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason ?? 'Unknown rejection'),
+      stack: reason instanceof Error ? reason.stack : undefined,
+    })
+    onError(entry)
+  }
+  window.addEventListener('error', handleError, true)
+  window.addEventListener('unhandledrejection', handleRejection)
+  return () => {
+    window.removeEventListener('error', handleError, true)
+    window.removeEventListener('unhandledrejection', handleRejection)
+  }
+}
+
+export function buildPdfDiagnosticReport(error, failureTrace = null) {
+  if (typeof window === 'undefined') return String(error ?? 'No PDF error details are available.')
+  const navigatorInfo = window.navigator ?? {}
+  const entries = (window.__pdfInitializationTrace ?? []).slice(-20)
+  const capabilities = {
+    secureContext: window.isSecureContext ?? null,
+    crossOriginIsolated: window.crossOriginIsolated ?? null,
+    promiseWithResolvers: typeof Promise.withResolvers,
+    promiseWithResolversPolyfilled: Boolean(globalThis.__actorsPrompterPromiseWithResolversPolyfilled),
+    worker: typeof window.Worker,
+    blob: typeof window.Blob,
+    fileReader: typeof window.FileReader,
+    fileArrayBuffer: typeof window.File?.prototype?.arrayBuffer,
+    canvas2d: (() => {
+      try { return Boolean(document.createElement('canvas').getContext('2d')) } catch { return false }
+    })(),
+    intersectionObserver: typeof window.IntersectionObserver,
+    resizeObserver: typeof window.ResizeObserver,
+    devicePixelRatio: window.devicePixelRatio ?? null,
+    deviceMemory: navigatorInfo.deviceMemory ?? null,
+  }
+  const traceText = entries.length
+    ? entries.map((entry, index) => `${index + 1}. ${entry.time} [${entry.status}] ${entry.stage}\n${JSON.stringify(entry, null, 2)}`).join('\n\n')
+    : 'No PDF initialization events were recorded.'
+  return [
+    'ACTORS PROMPTER — PDF DIAGNOSTIC REPORT',
+    `Captured: ${new Date().toISOString()}`,
+    `Page: ${window.location.href}`,
+    `Browser: ${navigatorInfo.userAgent ?? 'unknown'}`,
+    `Platform: ${navigatorInfo.platform ?? 'unknown'}`,
+    `Language: ${navigatorInfo.language ?? 'unknown'}`,
+    `Online: ${navigatorInfo.onLine ?? 'unknown'}`,
+    `Error shown: ${error || 'none'}`,
+    failureTrace ? `Failing stage: ${failureTrace.stage}` : '',
+    'Browser/runtime capabilities:',
+    JSON.stringify(capabilities, null, 2),
+    'Most recent PDF trace:',
+    traceText,
+  ].filter(Boolean).join('\n\n')
+}
+
 export function normalizePdfMatchText(value) {
   return String(value ?? '')
     .normalize('NFKD')

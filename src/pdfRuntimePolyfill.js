@@ -12,4 +12,5 @@ if (typeof Promise.withResolvers !== 'function') {
       return { promise, resolve, reject }
     },
   })
+  globalThis.__actorsPrompterPromiseWithResolversPolyfilled = true
 }
