@@ -268,7 +268,10 @@ export default function PdfFollowViewer({ file, fileId, fileName, pdfLibrary = [
       return observer
     }
     let observer
-    renderPages().then((value) => { observer = value })
+    renderPages().then((value) => {
+      if (cancelled) value?.disconnect()
+      else observer = value
+    })
     return () => {
       cancelled = true
       observer?.disconnect()
@@ -453,7 +456,7 @@ export default function PdfFollowViewer({ file, fileId, fileName, pdfLibrary = [
         {!file && <div className="pdf-follow-empty"><span aria-hidden="true">▤</span><strong>Choose audition sides</strong><p>Select a PDF above or add one from your device.</p><label className="quiet-button pdf-select-button">Add PDF from device<input type="file" accept="application/pdf,.pdf" onChange={(event) => { const selected = event.target.files?.[0]; if (selected) onPdfSelected?.(selected); event.target.value = '' }} /></label><p className="pdf-library-hint">Manage your saved PDFs from the home screen.</p></div>}
         {file && !pageRecords.length && !loadError && <div className="pdf-follow-loading">Loading script pages…</div>}
         {pageRecords.map((page, index) => (
-          <div className="pdf-follow-page" key={`${page.page}-${fileName}`} data-page-index={index} style={{ width: `${Math.min(viewerWidth, 800)}px`, height: `${Math.min(viewerWidth, 800) * page.height / page.width}px` }} ref={(element) => { pageRefs.current[index] = element }}>
+          <div className="pdf-follow-page" key={`${page.page}-${fileName}`} data-page-index={index} ref={(element) => { pageRefs.current[index] = element }}>
             <canvas ref={(element) => { canvasRefs.current[index] = element }} aria-label={`Script page ${page.page}`} />
             <span className="pdf-follow-page-number">{page.page}</span>
           </div>

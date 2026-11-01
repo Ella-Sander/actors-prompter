@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import { blocksRecordingGeneration, findPromptInsertion, isRecoverableRecognitionInterruption, movePromptInList } from './promptBehavior.js'
+import { getAudioContextConstructor, getMediaRecorderConstructor, getOfflineAudioContextConstructor, getPreferredRecordingMimeType, getSpeechRecognitionConstructor } from './browserCapabilities.js'
 import PdfFollowViewer from './PdfFollowViewer.jsx'
 import { describePdfError, loadPdfJsRuntime, readBlobAsArrayBuffer, readPdfPageTextItems, recordPdfDiagnostic, watchPdfWindowErrors } from './pdfFollow.js'
 import PdfDiagnosticDetails from './PdfDiagnosticDetails.jsx'
+import { createRetryablePromiseFactory } from './retryablePromise.js'
 import TtsWorker from './tts.worker.js?worker'
 import './App.css'
 
@@ -13,7 +15,6 @@ const NOISE_REDUCTION_VERSION = 2
 const MYSELF_SPEECH_END_MS = 450
 const MYSELF_FINAL_TRANSCRIPT_SETTLE_MS = 150
 
-let databasePromise
 const audioBoundsCache = new WeakMap()
 let ttsGenerationQueue = Promise.resolve()
 let ttsWorker
@@ -135,8 +136,8 @@ async function applyAdaptiveNoiseGate(audioBuffer) {
 }
 
 async function createNoiseReducedRecording(audioBlob) {
-  const AudioContextConstructor = window.AudioContext || window.webkitAudioContext
-  const OfflineAudioContextConstructor = window.OfflineAudioContext || window.webkitOfflineAudioContext
+  const AudioContextConstructor = getAudioContextConstructor(window)
+  const OfflineAudioContextConstructor = getOfflineAudioContextConstructor(window)
   if (!AudioContextConstructor || !OfflineAudioContextConstructor) {
     throw new Error('This browser does not support offline audio filtering.')
   }
@@ -322,6 +323,7 @@ async function extractScriptLines(file, onPageProgress = () => {}) {
   }
   recordPdfDiagnostic('script import: parse document', 'started', { byteLength: data.byteLength })
   const loadingTask = pdfjsLib.getDocument({ data })
+  try {
   let pdf
   try {
     pdf = await loadingTask.promise
@@ -407,13 +409,25 @@ async function extractScriptLines(file, onPageProgress = () => {}) {
     })
     throw error
   }
+  } finally {
+    if (typeof loadingTask.destroy === 'function') {
+      try {
+        await loadingTask.destroy()
+      } catch (cleanupError) {
+        recordPdfDiagnostic('script import: destroy PDF task', 'failed', {
+          error: cleanupError instanceof Error ? `${cleanupError.name}: ${cleanupError.message}` : String(cleanupError),
+          stack: cleanupError instanceof Error ? cleanupError.stack : undefined,
+        })
+      }
+    }
+  }
 }
 function getAudioBounds(blob) {
   if (!blob || typeof blob.arrayBuffer !== 'function') return Promise.resolve({ start: 0, end: 0 })
   if (audioBoundsCache.has(blob)) return audioBoundsCache.get(blob)
 
   const boundsPromise = (async () => {
-    const AudioContextConstructor = window.AudioContext || window.webkitAudioContext
+    const AudioContextConstructor = getAudioContextConstructor(window)
     if (!AudioContextConstructor) return { start: 0, end: 0 }
     let context
     try {
@@ -544,10 +558,13 @@ async function prepareAudioTrim(audio, blob, shouldTrim, onTrimEnd) {
   }
 }
 
-function openDatabase() {
-  if (!databasePromise) {
-    databasePromise = new Promise((resolve, reject) => {
-      const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION)
+const openDatabase = createRetryablePromiseFactory(() => new Promise((resolve, reject) => {
+      const indexedDb = globalThis.indexedDB
+      if (!indexedDb?.open) {
+        reject(new Error('This browser does not provide local database storage.'))
+        return
+      }
+      const request = indexedDb.open(DATABASE_NAME, DATABASE_VERSION)
       request.onupgradeneeded = (event) => {
         const database = request.result
         if (!database.objectStoreNames.contains('folders')) database.createObjectStore('folders', { keyPath: 'id' })
@@ -573,12 +590,16 @@ function openDatabase() {
           }
         }
       }
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-  }
-  return databasePromise
-}
+      request.onsuccess = () => {
+        const database = request.result
+        database.onversionchange = () => {
+          database.close()
+          openDatabase.reset()
+        }
+        resolve(database)
+      }
+      request.onerror = () => reject(request.error ?? new Error('The local database could not be opened.'))
+    }))
 
 function readAll(storeName) {
   return openDatabase().then((database) => new Promise((resolve, reject) => {
@@ -686,7 +707,7 @@ async function prepareReaderPitch(audio, speaker, pitch) {
   }
   let graph = readerPitchGraphs.get(audio)
   if (!graph) {
-    const AudioContextConstructor = window.AudioContext || window.webkitAudioContext
+    const AudioContextConstructor = getAudioContextConstructor(window)
     if (!AudioContextConstructor || !window.AudioWorkletNode) {
       throw new Error('Independent Reader pitch shifting is not supported by this browser.')
     }
@@ -1068,6 +1089,22 @@ function AudioPlayer({ audio, trimSilence = false, speaker = 'Myself', pitch = 1
 }
 
 
+function ScriptImportSource({ file, fileName }) {
+  const [sourceUrl, setSourceUrl] = useState('')
+
+  useEffect(() => {
+    if (!file) {
+      setSourceUrl('')
+      return undefined
+    }
+    const url = URL.createObjectURL(file)
+    setSourceUrl(url)
+    return () => URL.revokeObjectURL(url)
+  }, [file])
+
+  return sourceUrl ? <iframe className="script-source-pdf" src={sourceUrl} title={`Original PDF: ${fileName}`} /> : <p className="script-import-hint">Choose a PDF to preview its pages.</p>
+}
+
 function ScriptImportDialog({ folderName, pdfLibrary, onClose, onImport }) {
   const [fileName, setFileName] = useState('')
   const [selectedFile, setSelectedFile] = useState(null)
@@ -1075,6 +1112,7 @@ function ScriptImportDialog({ folderName, pdfLibrary, onClose, onImport }) {
   const [lines, setLines] = useState([])
   const [characters, setCharacters] = useState([])
   const [selectedCharacter, setSelectedCharacter] = useState('')
+  const [showSourcePdf, setShowSourcePdf] = useState(true)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const [pageProgress, setPageProgress] = useState(null)
@@ -1217,16 +1255,34 @@ function ScriptImportDialog({ folderName, pdfLibrary, onClose, onImport }) {
             {characters.map((name) => <option key={name} value={name}>{name}</option>)}
           </select>
           <p className="script-import-hint">Your selected character becomes Myself. Other characters become Reader.</p>
-          <div className="script-preview-list" aria-label="Review extracted dialogue">
-            {lines.map((line, index) => (
-              <div className={`script-preview-line${validateScriptDialogue(line.text).valid ? '' : ' is-invalid'}`} key={line.id}>
-                <div className="script-preview-label"><strong>{line.character}</strong><span>{line.character === selectedCharacter ? 'MYSELF' : 'READER'}  /  {String(index + 1).padStart(2, '0')}</span><button className="script-line-delete" type="button" onClick={() => removeLine(line.id)} disabled={loading} aria-label={`Remove ${line.character} dialogue ${index + 1}`}>Remove</button></div>
-                <textarea className="text-field script-preview-text" value={line.text} onChange={(event) => editLine(line.id, event.target.value)} disabled={loading} aria-label={`${line.character} dialogue ${index + 1}`} />
-                {!validateScriptDialogue(line.text).valid && <p className="script-validation-reason">Skipped during import: {validateScriptDialogue(line.text).reason}</p>}
-              </div>
-            ))}
+        </>}
+        {selectedFile && <>
+          <div className="script-review-heading">
+            <h3>Imported lines preview</h3>
+            <label className="script-source-toggle">
+              <input type="checkbox" checked={showSourcePdf} onChange={(event) => setShowSourcePdf(event.target.checked)} />
+              <span>Show original PDF</span>
+            </label>
           </div>
-          {lines.length === 0 && <p className="script-import-hint">All dialogue rows have been removed.</p>}
+          <div className={`script-review-columns${showSourcePdf ? '' : ' is-lines-only'}`}>
+            <section className="script-review-panel" aria-label="Recognized prompts">
+              <h3>Recognized prompts</h3>
+              <div className="script-preview-list">
+                {lines.map((line, index) => (
+                  <div className={`script-preview-line${validateScriptDialogue(line.text).valid ? '' : ' is-invalid'}`} key={line.id}>
+                    <div className="script-preview-label"><strong>{line.character}</strong><span>{line.character === selectedCharacter ? 'MYSELF' : 'READER'}  /  {String(index + 1).padStart(2, '0')}</span><button className="script-line-delete" type="button" onClick={() => removeLine(line.id)} disabled={loading} aria-label={`Remove ${line.character} dialogue ${index + 1}`}>Remove</button></div>
+                    <textarea className="text-field script-preview-text" value={line.text} onChange={(event) => editLine(line.id, event.target.value)} disabled={loading} aria-label={`${line.character} dialogue ${index + 1}`} />
+                    {!validateScriptDialogue(line.text).valid && <p className="script-validation-reason">Skipped during import: {validateScriptDialogue(line.text).reason}</p>}
+                  </div>
+                ))}
+              </div>
+            </section>
+            {showSourcePdf && <section className="script-review-panel" aria-label="Original PDF">
+              <h3>Original PDF</h3>
+              <ScriptImportSource file={selectedFile} fileName={fileName} />
+            </section>}
+          </div>
+          {lines.length === 0 && <p className="script-import-hint">{loading ? 'Recognized lines will appear here when the PDF finishes loading.' : characters.length ? 'All dialogue rows have been removed.' : 'No dialogue lines are available to preview.'}</p>}
         </>}
         {error && <p className="form-error" role="alert">{error}</p>}
         {pdfErrorTrace && <PdfDiagnosticDetails error={error} failureTrace={pdfErrorTrace} />}
@@ -1339,11 +1395,12 @@ function PromptDialog({ folderName, characters, prompt, readerPitch, readerPitch
       return
     }
 
-    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+    const MediaRecorderConstructor = getMediaRecorderConstructor(window)
+    if (!navigator.mediaDevices?.getUserMedia || !MediaRecorderConstructor) {
       recordPromptRecordingTrace('unsupported', {
         mediaDevices: Boolean(navigator.mediaDevices),
         getUserMedia: Boolean(navigator.mediaDevices?.getUserMedia),
-        mediaRecorder: Boolean(window.MediaRecorder),
+        mediaRecorder: Boolean(MediaRecorderConstructor),
       })
       setError('Audio recording is not supported in this browser.')
       recordingStartingRef.current = false
@@ -1356,15 +1413,10 @@ function PromptDialog({ folderName, characters, prompt, readerPitch, readerPitch
       recordPromptRecordingTrace('microphone-requested', { promptId: prompt?.id ?? 'new' })
       stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       recordPromptRecordingTrace('microphone-ready', { trackCount: stream.getAudioTracks().length })
-      const supportedMimeType = [
-        'audio/mp4;codecs=mp4a.40.2',
-        'audio/mp4',
-        'audio/webm;codecs=opus',
-        'audio/webm',
-      ].find((type) => MediaRecorder.isTypeSupported?.(type))
+      const supportedMimeType = getPreferredRecordingMimeType(MediaRecorderConstructor)
       const recorder = supportedMimeType
-        ? new MediaRecorder(stream, { mimeType: supportedMimeType })
-        : new MediaRecorder(stream)
+        ? new MediaRecorderConstructor(stream, { mimeType: supportedMimeType })
+        : new MediaRecorderConstructor(stream)
       chunksRef.current = []
       recordingFailedRef.current = false
       recorderRef.current = recorder
@@ -1406,7 +1458,7 @@ function PromptDialog({ folderName, characters, prompt, readerPitch, readerPitch
 
       // Start optional transcription only after the microphone recorder is running.
       // Safari can reject SpeechRecognition independently; that must not cancel audio capture.
-      const SpeechRecognitionApi = window.SpeechRecognition || window.webkitSpeechRecognition
+      const SpeechRecognitionApi = getSpeechRecognitionConstructor(window)
       if (SpeechRecognitionApi) {
         try {
           const recognition = new SpeechRecognitionApi()
@@ -2663,7 +2715,7 @@ function App() {
     if (session.voiceMonitorRequested) return
     session.voiceMonitorRequested = true
 
-    const AudioContextConstructor = window.AudioContext || window.webkitAudioContext
+    const AudioContextConstructor = getAudioContextConstructor(window)
     if (!navigator.mediaDevices?.getUserMedia || !AudioContextConstructor) return
 
     let stream
@@ -2735,7 +2787,7 @@ function App() {
       failRehearsal(session, 'Speech recognition requires HTTPS on your iPhone. Open the HTTPS LAN development URL and allow microphone access.')
       return
     }
-    const SpeechRecognitionApi = window.SpeechRecognition || window.webkitSpeechRecognition
+    const SpeechRecognitionApi = getSpeechRecognitionConstructor(window)
     if (!SpeechRecognitionApi) {
       failRehearsal(session, 'Speech recognition is not supported in this browser.')
       return
@@ -3647,7 +3699,7 @@ function App() {
             <span className="brand-mark" aria-hidden="true">P<span>/</span></span>
             <span className="brand-name">PROMPT<span>LIBRARY</span></span>
           </button>
-          {!selectedFolder && <span className="app-version">{`Ella v${APP_VERSION}`}</span>}
+          {!selectedFolder && <span className="app-version">{`Ellaa v${APP_VERSION}`}</span>}
         </div>
         <div className="topbar-tools">
           <div className="topbar-meta"><span className="status-dot" /> LOCAL ARCHIVE</div>

@@ -1,10 +1,13 @@
 import { KokoroTTS, env as kokoroEnv } from 'kokoro-js'
-import { env as transformersEnv } from '../node_modules/kokoro-js/node_modules/@huggingface/transformers/dist/transformers.web.js'
-import ortWasmModuleUrl from '../node_modules/kokoro-js/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.mjs?url'
-import ortWasmBinaryUrl from '../node_modules/kokoro-js/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.wasm?url'
+import { env as transformersEnv } from '@huggingface/transformers'
+import ortWasmModuleUrl from '../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.mjs?url'
+import ortWasmBinaryUrl from '../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.wasm?url'
 
 let synthesizerPromise
 let tracedFetchInstalled = false
+let modelCacheSanitizationPromise
+
+const kokoroModelCachePrefix = 'https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/'
 
 function trace(event, details = {}) {
   self.postMessage({ type: 'trace', event, details })
@@ -102,6 +105,48 @@ function installFetchTrace() {
   }
 }
 
+function sanitizeKokoroModelCache() {
+  if (modelCacheSanitizationPromise) return modelCacheSanitizationPromise
+
+  modelCacheSanitizationPromise = (async () => {
+    if (!self.caches?.open) return
+
+    try {
+      const cache = await self.caches.open('transformers-cache')
+      const requests = await cache.keys()
+      let inspected = 0
+      let removed = 0
+
+      for (const request of requests) {
+        const url = new URL(request.url)
+        if (url.origin !== 'https://huggingface.co' || !url.href.startsWith(kokoroModelCachePrefix)) continue
+
+        const response = await cache.match(request)
+        if (!response) continue
+        inspected += 1
+
+        const contentType = response.headers.get('content-type')?.toLowerCase() ?? ''
+        const isHtmlContentType = contentType.includes('text/html')
+        const isJsonAsset = url.pathname.toLowerCase().endsWith('.json')
+        const hasHtmlBody = isJsonAsset
+          && /^\s*(?:<!doctype\s+html|<html\b)/i.test((await response.clone().text()).slice(0, 128))
+
+        if (isHtmlContentType || hasHtmlBody) {
+          await cache.delete(request)
+          removed += 1
+          trace('model-cache-invalid-entry-removed', { file: url.pathname, contentType })
+        }
+      }
+
+      trace('model-cache-scan-complete', { inspected, removed })
+    } catch (error) {
+      trace('model-cache-scan-failed', errorDetails(error))
+    }
+  })()
+
+  return modelCacheSanitizationPromise
+}
+
 function ensureReadableStreamAsyncIterator() {
   const prototype = globalThis.ReadableStream?.prototype
   if (!prototype || Symbol.asyncIterator in prototype) return
@@ -140,6 +185,7 @@ async function getSynthesizer(requestId) {
   trace('module-import-ready')
   installFetchTrace()
   ensureReadableStreamAsyncIterator()
+  await sanitizeKokoroModelCache()
   kokoroEnv.wasmPaths = { mjs: ortWasmModuleUrl, wasm: ortWasmBinaryUrl }
   // The complete TTS pipeline is already in this dedicated worker. Keep ONNX
   // proxying off to avoid an unnecessary nested worker and cap compute threads

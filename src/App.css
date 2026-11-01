@@ -3612,7 +3612,7 @@ body.is-reordering-prompts * {
 }
 
 .script-import-dialog {
-  width: min(100%, 720px);
+  width: min(100%, 1180px);
   max-height: min(88vh, 900px);
   overflow: auto;
 }
@@ -3662,13 +3662,88 @@ body.is-reordering-prompts * {
   border-color: color-mix(in srgb, var(--accent-orange, #ff9d42) 48%, var(--tone-303030));
 }
 
+.script-review-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 14px 0 8px;
+}
+
+.script-review-heading > h3 {
+  margin: 0;
+  color: var(--tone-c6c6c6);
+  font-size: 11px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+
+.script-source-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 6px 10px;
+  border: 1px solid var(--tone-555);
+  border-radius: 3px;
+  color: var(--tone-c6c6c6);
+  background: var(--tone-111);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.script-source-toggle input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--tone-ff8a36);
+}
+
+.script-review-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: start;
+  gap: 16px;
+}
+
+.script-review-panel { min-width: 0; }
+
+.script-review-panel h3 {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--tone-303030);
+  border-bottom: 0;
+  color: var(--tone-c6c6c6);
+  background: var(--tone-111);
+  font-size: 10px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.script-source-pdf {
+  display: block;
+  width: 100%;
+  height: 52vh;
+  min-height: 320px;
+  border: 1px solid var(--tone-303030);
+  background: var(--tone-090909);
+}
+
+.script-review-columns.is-lines-only { grid-template-columns: minmax(0, 1fr); }
+
 .script-preview-list {
   display: grid;
   gap: 10px;
-  max-height: 42vh;
-  margin-top: 14px;
+  height: 52vh;
+  min-height: 320px;
   overflow: auto;
-  padding-right: 4px;
+  padding: 0 4px 0 0;
+}
+
+@media (max-width: 760px) {
+  .script-source-pdf,
+  .script-preview-list { height: 40vh; min-height: 260px; }
 }
 
 .script-preview-line {

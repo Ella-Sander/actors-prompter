@@ -9,6 +9,39 @@ const crossOriginIsolationHeaders = {
   'Cross-Origin-Embedder-Policy': 'require-corp',
 }
 
+const allowedKokoroAssets = new Set([
+  'config.json',
+  'tokenizer.json',
+  'tokenizer_config.json',
+  'special_tokens_map.json',
+  'generation_config.json',
+  'onnx/model_quantized.onnx',
+  'onnx/model_q8f16.onnx',
+  'voices/af_bella.bin',
+])
+
+const kokoroDevelopmentProxy = {
+  target: 'https://huggingface.co',
+  changeOrigin: true,
+  secure: true,
+  followRedirects: true,
+  bypass(request) {
+    if (request.method !== 'GET' && request.method !== 'HEAD') return false
+    try {
+      const assetPath = decodeURIComponent(new URL(request.url, 'http://localhost').pathname.slice('/api/kokoro/'.length))
+      return allowedKokoroAssets.has(assetPath) ? undefined : false
+    } catch {
+      return false
+    }
+  },
+  rewrite(path) {
+    return path.replace(
+      /^\/api\/kokoro\//,
+      '/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/',
+    )
+  },
+}
+
 function getLocalHttpsOptions() {
   if (process.env.ACTORS_PROMPTER_HTTPS !== '1') return undefined
 
@@ -36,6 +69,9 @@ export default defineConfig({
     strictPort: true,
     https: localHttpsOptions,
     headers: crossOriginIsolationHeaders,
+    proxy: {
+      '/api/kokoro/': kokoroDevelopmentProxy,
+    },
   },
   preview: {
     headers: crossOriginIsolationHeaders,

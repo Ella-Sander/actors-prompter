@@ -1,18 +1,10 @@
 import { Component, StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
+import { detectBrowserCapabilities } from './browserCapabilities.js'
 import './index.css'
 import App from './App.jsx'
 
-window.__promptBrowserCapabilities = {
-  secureContext: window.isSecureContext,
-  mediaDevices: Boolean(navigator.mediaDevices),
-  getUserMedia: Boolean(navigator.mediaDevices?.getUserMedia),
-  mediaRecorder: typeof window.MediaRecorder === 'function',
-  speechRecognition: Boolean(window.SpeechRecognition || window.webkitSpeechRecognition),
-  audioWorkletNode: typeof window.AudioWorkletNode === 'function',
-  crossOriginIsolated: Boolean(window.crossOriginIsolated),
-  sharedArrayBuffer: typeof window.SharedArrayBuffer === 'function',
-}
+window.__promptBrowserCapabilities = detectBrowserCapabilities(window)
 
 function reportGlobalFailure(kind, details) {
   const entry = {
